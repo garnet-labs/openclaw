@@ -13,13 +13,11 @@ jobs:
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
-      - name: List top-level deps
+      - name: List top-level packages
         run: pnpm list --depth 1 2>/dev/null | head -60 || true
