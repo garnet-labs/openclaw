@@ -1,17 +1,26 @@
-name: Garnet Runtime Visibility — openclaw
+name: Garnet Runtime Review — openclaw
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   dep-install:
-    name: Dependency Install
+    name: Dependency Install (monitored)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Garnet Runtime Visibility
+      - name: Garnet Runtime Review
         uses: garnet-org/action@v2
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
+          api_url: https://dev-api.garnet.ai
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
