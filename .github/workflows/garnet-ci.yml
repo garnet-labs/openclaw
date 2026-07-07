@@ -31,6 +31,6 @@ jobs:
       - name: List top-level packages
         run: pnpm list --depth 1 2>/dev/null | head -60 || true
       - name: Run unit tests (routing)
-        run: node scripts/run-vitest.mjs run --config test/vitest/vitest.unit.config.ts src/routing
+        run: node scripts/run-vitest.mjs run --config test/vitest/vitest.unit-fast.config.ts src/routing
       - name: Run unit tests (logging)
-        run: node scripts/run-vitest.mjs run --config test/vitest/vitest.unit.config.ts src/logging
+        run: node scripts/run-vitest.mjs run --config test/vitest/vitest.logging.config.ts src/logging
