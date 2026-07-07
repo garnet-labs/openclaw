@@ -1,14 +1,14 @@
+/** Handles /mcp commands for showing and mutating configured MCP servers. */
 import {
   listConfiguredMcpServers,
   setConfiguredMcpServer,
   unsetConfiguredMcpServer,
 } from "../../config/mcp-config.js";
-import { isInternalMessageChannel } from "../../utils/message-channel.js";
 import {
   rejectNonOwnerCommand,
   rejectUnauthorizedCommand,
   requireCommandFlagEnabled,
-  requireGatewayClientScopeForInternalChannel,
+  requireGatewayClientScope,
 } from "./command-gates.js";
 import type { CommandHandler } from "./commands-types.js";
 import { parseMcpCommand } from "./mcp-commands.js";
@@ -17,6 +17,7 @@ function renderJsonBlock(label: string, value: unknown): string {
   return `${label}\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
 }
 
+/** Command handler for /mcp show/set/unset operations. */
 export const handleMcpCommand: CommandHandler = async (params, allowTextCommands) => {
   if (!allowTextCommands) {
     return null;
@@ -29,9 +30,7 @@ export const handleMcpCommand: CommandHandler = async (params, allowTextCommands
   if (unauthorized) {
     return unauthorized;
   }
-  const allowInternalReadOnlyShow =
-    mcpCommand.action === "show" && isInternalMessageChannel(params.command.channel);
-  const nonOwner = allowInternalReadOnlyShow ? null : rejectNonOwnerCommand(params, "/mcp");
+  const nonOwner = rejectNonOwnerCommand(params, "/mcp");
   if (nonOwner) {
     return nonOwner;
   }
@@ -86,7 +85,7 @@ export const handleMcpCommand: CommandHandler = async (params, allowTextCommands
     };
   }
 
-  const missingAdminScope = requireGatewayClientScopeForInternalChannel(params, {
+  const missingAdminScope = requireGatewayClientScope(params, {
     label: "/mcp write",
     allowedScopes: ["operator.admin"],
     missingText: "❌ /mcp set|unset requires operator.admin for gateway clients.",

@@ -1,9 +1,18 @@
-import type { ReplyPayload } from "../auto-reply/types.js";
-import type { InteractiveReply, InteractiveReplyButton } from "../interactive/payload.js";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
-} from "../shared/string-coerce.js";
+} from "@openclaw/normalization-core/string-coerce";
+import type { ReplyPayload } from "../auto-reply/types.js";
+import type {
+  InteractiveReply,
+  InteractiveReplyButton,
+  MessagePresentation,
+  MessagePresentationButton,
+} from "../interactive/payload.js";
+import { formatHumanList } from "../shared/human-list.js";
+// Builds reply payloads for exec approval prompts and outcomes.
+import { formatFencedCodeBlock } from "../shared/markdown-code.js";
+import { formatApprovalDisplayPath } from "./approval-display-paths.js";
 import {
   describeNativeExecApprovalClientSetup,
   listNativeExecApprovalClientLabels,
@@ -33,7 +42,7 @@ export type ExecApprovalReplyMetadata = {
 export type ExecApprovalActionDescriptor = {
   decision: ExecApprovalReplyDecision;
   label: string;
-  style: NonNullable<InteractiveReplyButton["style"]>;
+  style: NonNullable<MessagePresentationButton["style"]>;
   command: string;
 };
 
@@ -62,19 +71,6 @@ export type ExecApprovalUnavailableReplyParams = {
   reason: ExecApprovalUnavailableReason;
   sentApproverDms?: boolean;
 };
-
-function formatHumanList(values: readonly string[]): string {
-  if (values.length === 0) {
-    return "";
-  }
-  if (values.length === 1) {
-    return values[0];
-  }
-  if (values.length === 2) {
-    return `${values[0]} or ${values[1]}`;
-  }
-  return `${values.slice(0, -1).join(", ")}, or ${values.at(-1)}`;
-}
 
 function resolveNativeExecApprovalClientList(params?: { excludeChannel?: string }): string {
   return formatHumanList(
@@ -106,7 +102,10 @@ function buildApprovalCommandFence(
   if (descriptors.length === 0) {
     return null;
   }
-  return buildFence(descriptors.map((descriptor) => descriptor.command).join("\n"), "txt");
+  return formatFencedCodeBlock(
+    descriptors.map((descriptor) => descriptor.command).join("\n"),
+    "txt",
+  );
 }
 
 export function buildExecApprovalCommandText(params: {
@@ -168,11 +167,62 @@ function buildApprovalInteractiveButtons(
 ): InteractiveReplyButton[] {
   return descriptors.map((descriptor) => ({
     label: descriptor.label,
+    action: { type: "command", command: descriptor.command },
     value: descriptor.command,
     style: descriptor.style,
   }));
 }
 
+function buildApprovalPresentationButtons(
+  descriptors: readonly ExecApprovalActionDescriptor[],
+): MessagePresentationButton[] {
+  return descriptors.map((descriptor) => ({
+    label: descriptor.label,
+    action: { type: "command", command: descriptor.command },
+    value: descriptor.command,
+    style: descriptor.style,
+  }));
+}
+
+/** Build the portable approval button presentation for already-resolved actions. */
+export function buildApprovalPresentationFromActionDescriptors(
+  actions: readonly ExecApprovalActionDescriptor[],
+): MessagePresentation | undefined {
+  const buttons = buildApprovalPresentationButtons(actions);
+  return buttons.length > 0 ? { blocks: [{ type: "buttons", buttons }] } : undefined;
+}
+
+/** Build the portable approval presentation for an approval id and decision allowlist. */
+export function buildApprovalPresentation(params: {
+  approvalId: string;
+  ask?: string | null;
+  allowedDecisions?: readonly ExecApprovalReplyDecision[];
+}): MessagePresentation | undefined {
+  return buildApprovalPresentationFromActionDescriptors(
+    buildExecApprovalActionDescriptors({
+      approvalCommandId: params.approvalId,
+      ask: params.ask,
+      allowedDecisions: params.allowedDecisions,
+    }),
+  );
+}
+
+/** Build the portable exec-approval presentation for command callback buttons. */
+export function buildExecApprovalPresentation(params: {
+  approvalCommandId: string;
+  ask?: string | null;
+  allowedDecisions?: readonly ExecApprovalReplyDecision[];
+}): MessagePresentation | undefined {
+  return buildApprovalPresentation({
+    approvalId: params.approvalCommandId,
+    ask: params.ask,
+    allowedDecisions: params.allowedDecisions,
+  });
+}
+
+/**
+ * @deprecated Use buildApprovalPresentationFromActionDescriptors.
+ */
 export function buildApprovalInteractiveReplyFromActionDescriptors(
   actions: readonly ExecApprovalActionDescriptor[],
 ): InteractiveReply | undefined {
@@ -180,6 +230,9 @@ export function buildApprovalInteractiveReplyFromActionDescriptors(
   return buttons.length > 0 ? { blocks: [{ type: "buttons", buttons }] } : undefined;
 }
 
+/**
+ * @deprecated Use buildApprovalPresentation.
+ */
 export function buildApprovalInteractiveReply(params: {
   approvalId: string;
   ask?: string | null;
@@ -194,6 +247,9 @@ export function buildApprovalInteractiveReply(params: {
   );
 }
 
+/**
+ * @deprecated Use buildExecApprovalPresentation.
+ */
 export function buildExecApprovalInteractiveReply(params: {
   approvalCommandId: string;
   ask?: string | null;
@@ -248,15 +304,6 @@ export function formatExecApprovalExpiresIn(expiresAtMs: number, nowMs: number):
     parts.push(`${seconds}s`);
   }
   return parts.join(" ");
-}
-
-function buildFence(text: string, language?: string): string {
-  let fence = "```";
-  while (text.includes(fence)) {
-    fence += "`";
-  }
-  const languagePrefix = language ? language : "";
-  return `${fence}${languagePrefix}\n${text}\n${fence}`;
 }
 
 export function getExecApprovalReplyMetadata(
@@ -314,10 +361,10 @@ export function buildExecApprovalPendingReplyPayload(
   lines.push("Approval required.");
   if (primaryAction) {
     lines.push("Run:");
-    lines.push(buildFence(primaryAction.command, "txt"));
+    lines.push(formatFencedCodeBlock(primaryAction.command, "txt"));
   }
   lines.push("Pending command:");
-  lines.push(buildFence(params.command, "sh"));
+  lines.push(formatFencedCodeBlock(params.command, "sh"));
   const secondaryFence = buildApprovalCommandFence(secondaryActions);
   if (secondaryFence) {
     lines.push("Other options:");
@@ -334,7 +381,7 @@ export function buildExecApprovalPendingReplyPayload(
     info.push(`Node: ${params.nodeId}`);
   }
   if (params.cwd) {
-    info.push(`CWD: ${params.cwd}`);
+    info.push(`CWD: ${formatApprovalDisplayPath(params.cwd)}`);
   }
   if (typeof params.expiresAtMs === "number" && Number.isFinite(params.expiresAtMs)) {
     info.push(
@@ -346,7 +393,7 @@ export function buildExecApprovalPendingReplyPayload(
 
   return {
     text: lines.join("\n\n"),
-    interactive: buildApprovalInteractiveReply({
+    presentation: buildApprovalPresentation({
       approvalId: params.approvalId,
       allowedDecisions,
     }),

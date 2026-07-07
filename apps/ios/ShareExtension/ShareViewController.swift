@@ -17,7 +17,7 @@ final class ShareViewController: UIViewController {
         var attachments: [ShareAttachment]
     }
 
-    private let logger = Logger(subsystem: "ai.openclaw.ios", category: "ShareExtension")
+    private let logger = Logger(subsystem: "ai.openclawfoundation.app", category: "ShareExtension")
     private var statusLabel: UILabel?
     private let draftTextView = UITextView()
     private let sendButton = UIButton(type: .system)
@@ -49,13 +49,15 @@ final class ShareViewController: UIViewController {
         self.draftTextView.textContainerInset = UIEdgeInsets(top: 12, left: 10, bottom: 12, right: 10)
 
         self.sendButton.translatesAutoresizingMaskIntoConstraints = false
-        self.sendButton.setTitle("Send to OpenClaw", for: .normal)
+        self.sendButton.setTitle(
+            NSLocalizedString("Send to OpenClaw", comment: "Share extension send action"),
+            for: .normal)
         self.sendButton.titleLabel?.font = .preferredFont(forTextStyle: .headline)
         self.sendButton.addTarget(self, action: #selector(self.handleSendTap), for: .touchUpInside)
         self.sendButton.isEnabled = false
 
         self.cancelButton.translatesAutoresizingMaskIntoConstraints = false
-        self.cancelButton.setTitle("Cancel", for: .normal)
+        self.cancelButton.setTitle(NSLocalizedString("Cancel", comment: "Share extension cancel action"), for: .normal)
         self.cancelButton.addTarget(self, action: #selector(self.handleCancelTap), for: .touchUpInside)
 
         let buttons = UIStackView(arrangedSubviews: [self.cancelButton, self.sendButton])
@@ -84,14 +86,16 @@ final class ShareViewController: UIViewController {
     private func prepareDraft() async {
         let traceId = UUID().uuidString
         ShareGatewayRelaySettings.saveLastEvent("Share opened.")
-        self.showStatus("Preparing share…")
+        self.showStatus(NSLocalizedString("Preparing share…", comment: "Share extension preparation status"))
         self.logger.info("share begin trace=\(traceId, privacy: .public)")
         let extracted = await self.extractSharedContent()
         let payload = extracted.payload
         self.pendingAttachments = extracted.attachments
+        self.logger.info("share payload trace=\(traceId, privacy: .public)")
         self.logger.info(
-            "share payload trace=\(traceId, privacy: .public) titleChars=\(payload.title?.count ?? 0) textChars=\(payload.text?.count ?? 0) hasURL=\(payload.url != nil) imageAttachments=\(self.pendingAttachments.count)"
-        )
+            "share payload title=\(payload.title?.count ?? 0) text=\(payload.text?.count ?? 0)")
+        self.logger.info(
+            "share attachments hasURL=\(payload.url != nil) images=\(self.pendingAttachments.count)")
         let message = self.composeDraft(from: payload)
         await MainActor.run {
             self.draftTextView.text = message
@@ -100,10 +104,12 @@ final class ShareViewController: UIViewController {
         }
         if message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             ShareGatewayRelaySettings.saveLastEvent("Share ready: waiting for message input.")
-            self.showStatus("Add a message, then tap Send.")
+            self.showStatus(NSLocalizedString(
+                "Add a message, then tap Send.",
+                comment: "Share extension empty draft guidance"))
         } else {
             ShareGatewayRelaySettings.saveLastEvent("Share ready: draft prepared.")
-            self.showStatus("Edit text, then tap Send.")
+            self.showStatus(NSLocalizedString("Edit text, then tap Send.", comment: "Share extension draft guidance"))
         }
     }
 
@@ -123,7 +129,7 @@ final class ShareViewController: UIViewController {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             ShareGatewayRelaySettings.saveLastEvent("Share blocked: message is empty.")
-            self.showStatus("Message is empty.")
+            self.showStatus(NSLocalizedString("Message is empty.", comment: "Share extension empty message status"))
             return
         }
 
@@ -132,20 +138,23 @@ final class ShareViewController: UIViewController {
             self.sendButton.isEnabled = false
             self.cancelButton.isEnabled = false
         }
-        self.showStatus("Sending to OpenClaw gateway…")
+        self.showStatus(NSLocalizedString("Sending to OpenClaw gateway…", comment: "Share extension sending status"))
         ShareGatewayRelaySettings.saveLastEvent("Sending to gateway…")
         do {
             try await self.sendMessageToGateway(trimmed, attachments: self.pendingAttachments)
             ShareGatewayRelaySettings.saveLastEvent(
                 "Sent to gateway (\(trimmed.count) chars, \(self.pendingAttachments.count) attachment(s)).")
-            self.showStatus("Sent to OpenClaw.")
+            self.showStatus(NSLocalizedString("Sent to OpenClaw.", comment: "Share extension success status"))
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
                 self.extensionContext?.completeRequest(returningItems: nil)
             }
         } catch {
             self.logger.error("share send failed reason=\(error.localizedDescription, privacy: .public)")
             ShareGatewayRelaySettings.saveLastEvent("Send failed: \(error.localizedDescription)")
-            self.showStatus("Send failed: \(error.localizedDescription)")
+            self.showStatus(
+                String(
+                    format: NSLocalizedString("Send failed: %@", comment: "Share extension failure status"),
+                    error.localizedDescription))
             await MainActor.run {
                 self.isSending = false
                 self.sendButton.isEnabled = true
@@ -155,17 +164,25 @@ final class ShareViewController: UIViewController {
     }
 
     private func sendMessageToGateway(_ message: String, attachments: [ShareAttachment]) async throws {
-        guard let config = ShareGatewayRelaySettings.loadConfig() else {
+        guard let config = ShareGatewayRelaySettings.loadConfigDiscardingUnscopedDeviceAuth() else {
             throw NSError(
                 domain: "OpenClawShare",
                 code: 10,
-                userInfo: [NSLocalizedDescriptionKey: "OpenClaw is not connected to a gateway yet."])
+                userInfo: [
+                    NSLocalizedDescriptionKey: NSLocalizedString(
+                        "OpenClaw is not connected to a gateway yet.",
+                        comment: "Share extension missing gateway error"),
+                ])
         }
         guard let url = URL(string: config.gatewayURLString) else {
             throw NSError(
                 domain: "OpenClawShare",
                 code: 11,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid saved gateway URL."])
+                userInfo: [
+                    NSLocalizedDescriptionKey: NSLocalizedString(
+                        "Invalid saved gateway URL.",
+                        comment: "Share extension invalid gateway error"),
+                ])
         }
 
         let gateway = GatewayNodeSession()
@@ -182,7 +199,10 @@ final class ShareViewController: UIViewController {
                 clientId: clientId,
                 clientMode: "node",
                 clientDisplayName: "OpenClaw Share",
-                includeDeviceIdentity: false)
+                deviceIdentityProfile: .shareExtension,
+                includeDeviceIdentity: true,
+                allowStoredDeviceAuth: config.gatewayStableID != nil,
+                deviceAuthGatewayID: config.gatewayStableID)
         }
 
         do {
@@ -287,7 +307,7 @@ final class ShareViewController: UIViewController {
             let isInvalidConnectParams =
                 (code.contains("invalid") && code.contains("connect"))
                 || message.contains("invalid connect params")
-            if isInvalidConnectParams && mentionsClientIdPath {
+            if isInvalidConnectParams, mentionsClientIdPath {
                 return true
             }
         }
@@ -405,7 +425,6 @@ final class ShareViewController: UIViewController {
                 } else {
                     unknownCount += 1
                 }
-
             }
         }
 
@@ -475,7 +494,7 @@ final class ShareViewController: UIViewController {
         if provider.hasItemConformingToTypeIdentifier(UTType.text.identifier) {
             if let text = await self.loadTextValue(from: provider, typeIdentifier: UTType.text.identifier),
                let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)),
-                   url.scheme != nil
+               url.scheme != nil
             {
                 return url
             }

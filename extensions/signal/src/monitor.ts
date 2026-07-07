@@ -1,13 +1,17 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
-import type { SignalReactionNotificationMode } from "openclaw/plugin-sdk/config-runtime";
-import { loadConfig } from "openclaw/plugin-sdk/config-runtime";
+// Signal plugin module implements monitor behavior.
+import { CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY } from "openclaw/plugin-sdk/approval-handler-adapter-runtime";
+import type { ChannelRuntimeSurface } from "openclaw/plugin-sdk/channel-contract";
+import { registerChannelRuntimeContext } from "openclaw/plugin-sdk/channel-runtime-context";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type {
+  ReplyToMode,
+  SignalReactionNotificationMode,
+} from "openclaw/plugin-sdk/config-contracts";
 import {
-  resolveAllowlistProviderRuntimeGroupPolicy,
-  resolveDefaultGroupPolicy,
-  warnMissingProviderGroupPolicyFallbackOnce,
-} from "openclaw/plugin-sdk/config-runtime";
-import { waitForTransportReady } from "openclaw/plugin-sdk/infra-runtime";
-import { estimateBase64DecodedBytes, saveMediaBuffer } from "openclaw/plugin-sdk/media-runtime";
+  detectMime,
+  estimateBase64DecodedBytes,
+  saveMediaBuffer,
+} from "openclaw/plugin-sdk/media-runtime";
 import { DEFAULT_GROUP_HISTORY_LIMIT, type HistoryEntry } from "openclaw/plugin-sdk/reply-history";
 import {
   deliverTextOrMediaReply,
@@ -16,26 +20,40 @@ import {
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import {
   chunkTextWithMode,
+  createReplyReferencePlanner,
   resolveChunkMode,
   resolveTextChunkLimit,
 } from "openclaw/plugin-sdk/reply-runtime";
+import { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import {
   createNonExitingRuntime,
   type BackoffPolicy,
   type RuntimeEnv,
 } from "openclaw/plugin-sdk/runtime-env";
 import {
-  normalizeE164,
+  resolveAllowlistProviderRuntimeGroupPolicy,
+  resolveDefaultGroupPolicy,
+  warnMissingProviderGroupPolicyFallbackOnce,
+} from "openclaw/plugin-sdk/runtime-group-policy";
+import {
   normalizeOptionalString,
   normalizeStringEntries,
-} from "openclaw/plugin-sdk/text-runtime";
-import { resolveSignalAccount } from "./accounts.js";
-import { signalCheck, signalRpcRequest } from "./client.js";
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { normalizeE164 } from "openclaw/plugin-sdk/text-utility-runtime";
+import { waitForTransportReady } from "openclaw/plugin-sdk/transport-ready-runtime";
+import { resolveSignalAccount, resolveSignalReplyToMode } from "./accounts.js";
+import { isSignalNativeApprovalHandlerConfigured } from "./approval-native.js";
+import {
+  addSignalApprovalReactionHintToStructuredPayload,
+  registerSignalApprovalReactionTargetForDeliveredPayload,
+} from "./approval-reactions.js";
+import { signalRpcRequest, signalCheck } from "./client-adapter.js";
 import { formatSignalDaemonExit, spawnSignalDaemon, type SignalDaemonHandle } from "./daemon.js";
 import { isSignalSenderAllowed, type resolveSignalSender } from "./identity.js";
 import { createSignalEventHandler } from "./monitor/event-handler.js";
 import type {
   SignalAttachment,
+  SignalNativeReplyContext,
   SignalReactionMessage,
   SignalReactionTarget,
 } from "./monitor/event-handler.types.js";
@@ -49,9 +67,11 @@ export type MonitorSignalOpts = {
   accountId?: string;
   config?: OpenClawConfig;
   baseUrl?: string;
+  channelRuntime?: ChannelRuntimeSurface;
   autoStart?: boolean;
   startupTimeoutMs?: number;
   cliPath?: string;
+  configPath?: string;
   httpHost?: string;
   httpPort?: number;
   receiveMode?: "on-start" | "manual";
@@ -67,6 +87,24 @@ export type MonitorSignalOpts = {
 
 function resolveRuntime(opts: MonitorSignalOpts): RuntimeEnv {
   return opts.runtime ?? createNonExitingRuntime();
+}
+
+function createSignalMonitorTaskRunner(runtime: RuntimeEnv) {
+  const inFlight = new Set<Promise<void>>();
+  return {
+    runEventTask(task: () => Promise<void>): void {
+      const trackedTask = Promise.resolve()
+        .then(task)
+        .catch((err: unknown) => runtime.error?.(`event handler failed: ${String(err)}`))
+        .finally(() => inFlight.delete(trackedTask));
+      inFlight.add(trackedTask);
+    },
+    async waitForIdle(): Promise<void> {
+      while (inFlight.size > 0) {
+        await Promise.allSettled(inFlight);
+      }
+    },
+  };
 }
 
 function mergeAbortSignals(
@@ -251,9 +289,24 @@ async function waitForSignalDaemonReady(params: {
   });
 }
 
+const SIGNAL_ATTACHMENT_RPC_RESPONSE_HEADROOM_BYTES = 64 * 1024;
+const SIGNAL_BASE64_OVERHEAD_NUMERATOR = 4;
+const SIGNAL_BASE64_OVERHEAD_DENOMINATOR = 3;
+
+function deriveSignalAttachmentRpcMaxResponseBytes(maxBytes: number): number | undefined {
+  if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
+    return undefined;
+  }
+  const base64Bytes = Math.ceil(
+    (maxBytes * SIGNAL_BASE64_OVERHEAD_NUMERATOR) / SIGNAL_BASE64_OVERHEAD_DENOMINATOR,
+  );
+  return base64Bytes + SIGNAL_ATTACHMENT_RPC_RESPONSE_HEADROOM_BYTES;
+}
+
 async function fetchAttachment(params: {
   baseUrl: string;
   account?: string;
+  apiMode?: "native" | "container" | "auto";
   attachment: SignalAttachment;
   sender?: string;
   groupId?: string;
@@ -284,6 +337,8 @@ async function fetchAttachment(params: {
 
   const result = await signalRpcRequest<{ data?: string }>("getAttachment", rpcParams, {
     baseUrl: params.baseUrl,
+    maxResponseBytes: deriveSignalAttachmentRpcMaxResponseBytes(params.maxBytes),
+    apiMode: params.apiMode,
   });
   if (!result?.data) {
     return null;
@@ -294,61 +349,208 @@ async function fetchAttachment(params: {
     );
   }
   const buffer = Buffer.from(result.data, "base64");
+  const originalFilename = normalizeOptionalString(attachment.filename ?? undefined);
+  const contentType =
+    normalizeOptionalString(attachment.contentType ?? undefined) ??
+    (await detectMime({ buffer, filePath: originalFilename }));
   const saved = await saveMediaBuffer(
     buffer,
-    attachment.contentType ?? undefined,
+    contentType,
     "inbound",
     params.maxBytes,
+    originalFilename,
   );
   return { path: saved.path, contentType: saved.contentType };
 }
 
-async function deliverReplies(params: {
+export async function deliverReplies(params: {
+  cfg: OpenClawConfig;
   replies: ReplyPayload[];
   target: string;
   baseUrl: string;
   account?: string;
+  accountUuid?: string;
   accountId?: string;
   runtime: RuntimeEnv;
   maxBytes: number;
   textLimit: number;
   chunkMode: "length" | "newline";
+  replyContext?: SignalNativeReplyContext;
+  chatType?: "direct" | "group";
 }) {
-  const { replies, target, baseUrl, account, accountId, runtime, maxBytes, textLimit, chunkMode } =
-    params;
+  const {
+    replies,
+    target,
+    baseUrl,
+    account,
+    accountUuid,
+    accountId,
+    runtime,
+    maxBytes,
+    textLimit,
+    chunkMode,
+  } = params;
+  const replyToMode = resolveSignalReplyToMode({
+    cfg: params.cfg,
+    accountId,
+    chatType: params.chatType,
+  });
   for (const payload of replies) {
-    const reply = resolveSendableOutboundReplyParts(payload);
+    const deliveryResults: Array<{
+      channel: "signal";
+      messageId: string;
+      meta: { signalVisibleText: string };
+    }> = [];
+    const deliveredPayload =
+      addSignalApprovalReactionHintToStructuredPayload({
+        cfg: params.cfg,
+        accountId,
+        to: target,
+        payload,
+        targetAuthor: account,
+        targetAuthorUuid: accountUuid,
+      }) ?? payload;
+    const reply = resolveSendableOutboundReplyParts(deliveredPayload);
+    const nextNativeReply = createSignalNativeReplyResolver({
+      payload: deliveredPayload,
+      replyContext: params.replyContext,
+      replyToMode,
+    });
+    const recordDeliveryResult = (
+      result: Awaited<ReturnType<typeof sendMessageSignal>>,
+      visibleText: string,
+    ) => {
+      const messageId =
+        typeof result?.messageId === "string" && result.messageId.trim()
+          ? result.messageId.trim()
+          : null;
+      if (messageId) {
+        deliveryResults.push({
+          channel: "signal",
+          messageId,
+          meta: { signalVisibleText: visibleText },
+        });
+      }
+    };
     const delivered = await deliverTextOrMediaReply({
-      payload,
+      payload: deliveredPayload,
       text: reply.text,
       chunkText: (value) => chunkTextWithMode(value, textLimit, chunkMode),
       sendText: async (chunk) => {
-        await sendMessageSignal(target, chunk, {
-          baseUrl,
-          account,
-          maxBytes,
-          accountId,
-        });
+        recordDeliveryResult(
+          await sendMessageSignal(target, chunk, {
+            cfg: params.cfg,
+            baseUrl,
+            account,
+            maxBytes,
+            accountId,
+            ...nextNativeReply(),
+          }),
+          chunk,
+        );
       },
       sendMedia: async ({ mediaUrl, caption }) => {
-        await sendMessageSignal(target, caption ?? "", {
-          baseUrl,
-          account,
-          mediaUrl,
-          maxBytes,
-          accountId,
-        });
+        const visibleText = caption ?? "";
+        recordDeliveryResult(
+          await sendMessageSignal(target, visibleText, {
+            cfg: params.cfg,
+            baseUrl,
+            account,
+            mediaUrl,
+            maxBytes,
+            accountId,
+            ...nextNativeReply(),
+          }),
+          visibleText,
+        );
       },
     });
     if (delivered !== "empty") {
+      registerSignalApprovalReactionTargetForDeliveredPayload({
+        cfg: params.cfg,
+        target: {
+          channel: "signal",
+          to: target,
+          accountId,
+        },
+        payload: deliveredPayload,
+        results: deliveryResults,
+        targetAuthor: account,
+        targetAuthorUuid: accountUuid,
+      });
       runtime.log?.(`delivered reply to ${target}`);
     }
   }
 }
 
+function resolveSignalNativeReplyOptions(params: {
+  payload: ReplyPayload;
+  replyContext?: SignalNativeReplyContext;
+}): Pick<Parameters<typeof sendMessageSignal>[2], "replyToId" | "replyToAuthor" | "replyToBody"> {
+  if (params.payload.replyToCurrent === false) {
+    return {};
+  }
+  const payloadReplyToId = normalizeOptionalString(params.payload.replyToId);
+  const contextReplyToId = normalizeOptionalString(params.replyContext?.replyToId);
+  if (!payloadReplyToId || !contextReplyToId || payloadReplyToId !== contextReplyToId) {
+    return {};
+  }
+  const replyToAuthor = normalizeOptionalString(params.replyContext?.author);
+  if (!replyToAuthor) {
+    return { replyToId: payloadReplyToId };
+  }
+  return {
+    replyToId: payloadReplyToId,
+    replyToAuthor,
+    replyToBody: params.replyContext?.body ?? "",
+  };
+}
+
+function isSignalStatusNoticePayload(payload: ReplyPayload): boolean {
+  return Boolean(payload.isCompactionNotice || payload.isFallbackNotice || payload.isStatusNotice);
+}
+
+function createSignalNativeReplyResolver(params: {
+  payload: ReplyPayload;
+  replyContext?: SignalNativeReplyContext;
+  replyToMode: ReplyToMode;
+}): () => Pick<
+  Parameters<typeof sendMessageSignal>[2],
+  "replyToId" | "replyToAuthor" | "replyToBody"
+> {
+  const nativeReply = resolveSignalNativeReplyOptions(params);
+  if (!nativeReply.replyToId) {
+    return () => ({});
+  }
+  const isExplicitReply =
+    params.payload.replyToTag === true || params.payload.replyToCurrent === true;
+  const isStatusNotice = isSignalStatusNoticePayload(params.payload);
+  if (isStatusNotice && params.replyToMode === "off") {
+    return () => ({});
+  }
+  if (isExplicitReply) {
+    return () => nativeReply;
+  }
+  if (isStatusNotice) {
+    return () => nativeReply;
+  }
+  const planner = createReplyReferencePlanner({
+    replyToMode: params.replyToMode,
+    existingId: nativeReply.replyToId,
+    hasReplied: params.replyContext?.state?.hasReplied,
+  });
+  return () => {
+    const replyToId = planner.use();
+    if (params.replyContext?.state && !isStatusNotice) {
+      params.replyContext.state.hasReplied = planner.hasReplied();
+    }
+    return replyToId ? { ...nativeReply, replyToId } : {};
+  };
+}
+
 export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promise<void> {
   const runtime = resolveRuntime(opts);
-  const cfg = opts.config ?? loadConfig();
+  const cfg = opts.config ?? getRuntimeConfig();
   const accountInfo = resolveSignalAccount({
     cfg,
     accountId: opts.accountId,
@@ -395,20 +597,32 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
   const waitForTransportReadyFn = opts.waitForTransportReady ?? waitForTransportReady;
 
   const autoStart = opts.autoStart ?? accountInfo.config.autoStart ?? !accountInfo.config.httpUrl;
+  const configuredApiMode = cfg.channels?.signal?.apiMode ?? "auto";
   const startupTimeoutMs = Math.min(
     120_000,
     Math.max(1_000, opts.startupTimeoutMs ?? accountInfo.config.startupTimeoutMs ?? 30_000),
   );
-  const readReceiptsViaDaemon = Boolean(autoStart && sendReadReceipts);
+  const readReceiptsViaDaemon = autoStart && sendReadReceipts;
   const daemonLifecycle = createSignalDaemonLifecycle({ abortSignal: opts.abortSignal });
+  const monitorTaskRunner = createSignalMonitorTaskRunner(runtime);
   let daemonHandle: SignalDaemonHandle | null = null;
+
+  if (autoStart && configuredApiMode === "container") {
+    throw new Error(
+      "channels.signal.autoStart=true is incompatible with channels.signal.apiMode=container",
+    );
+  }
 
   if (autoStart) {
     const cliPath = opts.cliPath ?? accountInfo.config.cliPath ?? "signal-cli";
+    const configPath =
+      normalizeOptionalString(opts.configPath) ??
+      normalizeOptionalString(accountInfo.config.configPath);
     const httpHost = opts.httpHost ?? accountInfo.config.httpHost ?? "127.0.0.1";
     const httpPort = opts.httpPort ?? accountInfo.config.httpPort ?? 8080;
     daemonHandle = spawnSignalDaemon({
       cliPath,
+      ...(configPath ? { configPath } : {}),
       account,
       httpHost,
       httpPort,
@@ -443,6 +657,25 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
       }
     }
 
+    registerChannelRuntimeContext({
+      channelRuntime: opts.channelRuntime,
+      channelId: "signal",
+      accountId: accountInfo.accountId,
+      capability: CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY,
+      context: isSignalNativeApprovalHandlerConfigured({
+        cfg,
+        accountId: accountInfo.accountId,
+      })
+        ? {
+            accountId: accountInfo.accountId,
+            baseUrl,
+            account,
+            accountUuid: accountInfo.config.accountUuid,
+          }
+        : null,
+      abortSignal: opts.abortSignal,
+    });
+
     const handleEvent = createSignalEventHandler({
       runtime,
       cfg,
@@ -464,8 +697,8 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
       ignoreAttachments,
       sendReadReceipts,
       readReceiptsViaDaemon,
-      fetchAttachment,
-      deliverReplies: (params) => deliverReplies({ ...params, chunkMode }),
+      fetchAttachment: (params) => fetchAttachment({ ...params, apiMode: configuredApiMode }),
+      deliverReplies: (params) => deliverReplies({ ...params, cfg, chunkMode }),
       resolveSignalReactionTargets,
       isSignalReactionMessage,
       shouldEmitSignalReactionNotification,
@@ -477,11 +710,12 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
       account,
       abortSignal: daemonLifecycle.abortSignal,
       runtime,
+      // signal-cli can keep the SSE event endpoint idle until the next inbound event.
+      timeoutMs: 0,
+      apiMode: configuredApiMode,
       policy: opts.reconnectPolicy,
       onEvent: (event) => {
-        void handleEvent(event).catch((err) => {
-          runtime.error?.(`event handler failed: ${String(err)}`);
-        });
+        monitorTaskRunner.runEventTask(() => handleEvent(event));
       },
     });
     const daemonExitError = daemonLifecycle.getExitError();
@@ -495,6 +729,7 @@ export async function monitorSignalProvider(opts: MonitorSignalOpts = {}): Promi
     }
     throw err;
   } finally {
+    await monitorTaskRunner.waitForIdle();
     daemonLifecycle.dispose();
     opts.abortSignal?.removeEventListener("abort", onAbort);
     daemonLifecycle.stop();

@@ -1,3 +1,4 @@
+// Live session model switch tests cover model changes during isolated cron runs.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LiveSessionModelSwitchError } from "../../agents/live-model-switch-error.js";
 import {
@@ -11,7 +12,7 @@ import {
   resolveCronSessionMock,
   resolveSessionAuthProfileOverrideMock,
   resetRunCronIsolatedAgentTurnHarness,
-  runEmbeddedPiAgentMock,
+  runEmbeddedAgentMock,
   runWithModelFallbackMock,
   updateSessionStoreMock,
 } from "./run.test-harness.js";
@@ -65,7 +66,33 @@ function makeSuccessfulRunResult(modelUsed = "claude-sonnet-4-6") {
   };
 }
 
-// ---------- tests ----------
+function requireEmbeddedAgentCall(index: number): {
+  provider?: string;
+  model?: string;
+  authProfileId?: string;
+  authProfileIdSource?: string;
+  suppressNextUserMessagePersistence?: boolean;
+  userTurnTranscriptRecorder?: {
+    markRuntimePersisted: (message: { role: "user"; content: string }) => void;
+  };
+} {
+  const call = runEmbeddedAgentMock.mock.calls[index]?.[0] as
+    | {
+        provider?: string;
+        model?: string;
+        authProfileId?: string;
+        authProfileIdSource?: string;
+        suppressNextUserMessagePersistence?: boolean;
+        userTurnTranscriptRecorder?: {
+          markRuntimePersisted: (message: { role: "user"; content: string }) => void;
+        };
+      }
+    | undefined;
+  if (!call) {
+    throw new Error(`Expected embedded OpenClaw agent call ${index}`);
+  }
+  return call;
+}
 
 describe("runCronIsolatedAgentTurn — LiveSessionModelSwitchError retry (#57206)", () => {
   let previousFastTestEnv: string | undefined;
@@ -160,10 +187,8 @@ describe("runCronIsolatedAgentTurn — LiveSessionModelSwitchError retry (#57206
     expect(result.status).toBe("error");
     expect(String(result.error)).toContain("transient network error");
     expect(updateSessionStoreMock).toHaveBeenCalled();
-    expect(cronSession.sessionEntry).toMatchObject({
-      model: "claude-sonnet-4-6",
-      modelProvider: "anthropic",
-    });
+    expect(cronSession.sessionEntry.model).toBe("claude-sonnet-4-6");
+    expect(cronSession.sessionEntry.modelProvider).toBe("anthropic");
   });
 
   it("retries with switched auth profile state from LiveSessionModelSwitchError", async () => {
@@ -185,15 +210,19 @@ describe("runCronIsolatedAgentTurn — LiveSessionModelSwitchError retry (#57206
       model,
       attempts: [],
     }));
-    runEmbeddedPiAgentMock
-      .mockRejectedValueOnce(
-        new LiveSessionModelSwitchError({
+    runEmbeddedAgentMock
+      .mockImplementationOnce(async (request) => {
+        request.userTurnTranscriptRecorder?.markRuntimePersisted({
+          role: "user",
+          content: "run task",
+        });
+        throw new LiveSessionModelSwitchError({
           provider: "anthropic",
           model: "claude-sonnet-4-6",
           authProfileId: "profile-b",
           authProfileIdSource: "user",
-        }),
-      )
+        });
+      })
       .mockResolvedValueOnce({
         payloads: [{ text: "task complete" }],
         meta: {
@@ -208,17 +237,18 @@ describe("runCronIsolatedAgentTurn — LiveSessionModelSwitchError retry (#57206
     const result = await runCronIsolatedAgentTurn(makeParams());
 
     expect(result.status).toBe("ok");
-    expect(runEmbeddedPiAgentMock).toHaveBeenCalledTimes(2);
-    expect(runEmbeddedPiAgentMock.mock.calls[1]?.[0]).toMatchObject({
-      provider: "anthropic",
-      model: "claude-sonnet-4-6",
-      authProfileId: "profile-b",
-      authProfileIdSource: "user",
-    });
-    expect(cronSession.sessionEntry).toMatchObject({
-      authProfileOverride: "profile-b",
-      authProfileOverrideSource: "user",
-    });
+    expect(runEmbeddedAgentMock).toHaveBeenCalledTimes(2);
+    const retryParams = requireEmbeddedAgentCall(1);
+    expect(retryParams.provider).toBe("anthropic");
+    expect(retryParams.model).toBe("claude-sonnet-4-6");
+    expect(retryParams.authProfileId).toBe("profile-b");
+    expect(retryParams.authProfileIdSource).toBe("user");
+    const firstParams = requireEmbeddedAgentCall(0);
+    expect(retryParams.userTurnTranscriptRecorder).toBe(firstParams.userTurnTranscriptRecorder);
+    expect(firstParams.suppressNextUserMessagePersistence).toBe(false);
+    expect(retryParams.suppressNextUserMessagePersistence).toBe(true);
+    expect(cronSession.sessionEntry.authProfileOverride).toBe("profile-b");
+    expect(cronSession.sessionEntry.authProfileOverrideSource).toBe("user");
   });
 
   it("returns error (not infinite loop) when LiveSessionModelSwitchError is thrown repeatedly", async () => {
@@ -266,7 +296,9 @@ describe("runCronIsolatedAgentTurn — LiveSessionModelSwitchError retry (#57206
     expect(result.status).toBe("error");
     // Circuit breaker: max 2 retries → 3 total attempts (initial + 2 retries)
     expect(callCount).toBe(3);
-    expect(logWarnMock).toHaveBeenCalledWith(expect.stringContaining("retry limit reached"));
+    expect(logWarnMock).toHaveBeenCalledWith(
+      "[cron:cron-model-switch-job] LiveSessionModelSwitchError retry limit reached (2); aborting",
+    );
   });
 
   it("does not retry when the thrown error is not a LiveSessionModelSwitchError", async () => {

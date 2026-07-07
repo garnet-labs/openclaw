@@ -1,182 +1,64 @@
-import crypto from "node:crypto";
-import type { OpenClawConfig } from "../config/config.js";
-import { loadConfig, writeConfigFile } from "../config/config.js";
-import { resolveGatewayAuth } from "../gateway/auth.js";
-import { ensureGatewayStartupAuth } from "../gateway/startup-auth.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalString,
-} from "../shared/string-coerce.js";
+// Browser control auth helpers resolve plugin browser credentials from OpenClaw config.
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { loadBundledPluginPublicSurfaceModuleSync } from "./facade-loader.js";
 
+/** Browser control credentials resolved from config, env, or generated setup state. */
 export type BrowserControlAuth = {
+  /** Bearer token accepted by the browser control HTTP surface. */
   token?: string;
+  /** Password fallback for deployments that expose password-based browser control auth. */
   password?: string;
 };
 
+/** Inputs used when resolving or creating browser control auth for the active config. */
+type EnsureBrowserControlAuthParams = {
+  cfg: OpenClawConfig;
+  env?: NodeJS.ProcessEnv;
+};
+
+/** Resolved auth plus the generated token when this call created one. */
+type EnsureBrowserControlAuthResult = {
+  auth: BrowserControlAuth;
+  generatedToken?: string;
+};
+
+type BrowserControlAuthSurface = {
+  resolveBrowserControlAuth: (cfg?: OpenClawConfig, env?: NodeJS.ProcessEnv) => BrowserControlAuth;
+  shouldAutoGenerateBrowserAuth: (env: NodeJS.ProcessEnv) => boolean;
+  ensureBrowserControlAuth: (
+    params: EnsureBrowserControlAuthParams,
+  ) => Promise<EnsureBrowserControlAuthResult>;
+};
+
+let cachedBrowserControlAuthSurface: BrowserControlAuthSurface | undefined;
+
+function loadBrowserControlAuthSurface(): BrowserControlAuthSurface {
+  // Browser owns auth generation and env precedence; this SDK wrapper only keeps
+  // the lazy public facade stable for plugin authors.
+  cachedBrowserControlAuthSurface ??=
+    loadBundledPluginPublicSurfaceModuleSync<BrowserControlAuthSurface>({
+      dirName: "browser",
+      artifactBasename: "browser-control-auth.js",
+    });
+  return cachedBrowserControlAuthSurface;
+}
+
+/** Resolves browser control auth from config/env without generating new credentials. */
 export function resolveBrowserControlAuth(
   cfg?: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): BrowserControlAuth {
-  const auth = resolveGatewayAuth({
-    authConfig: cfg?.gateway?.auth,
-    env,
-    tailscaleMode: cfg?.gateway?.tailscale?.mode,
-  });
-  const token = normalizeOptionalString(auth.token) ?? "";
-  const password = normalizeOptionalString(auth.password) ?? "";
-  return {
-    token: token || undefined,
-    password: password || undefined,
-  };
+  return loadBrowserControlAuthSurface().resolveBrowserControlAuth(cfg, env);
 }
 
+/** Returns whether browser control auth should be generated for this environment. */
 export function shouldAutoGenerateBrowserAuth(env: NodeJS.ProcessEnv): boolean {
-  const nodeEnv = normalizeLowercaseStringOrEmpty(env.NODE_ENV);
-  if (nodeEnv === "test") {
-    return false;
-  }
-  const vitest = normalizeLowercaseStringOrEmpty(env.VITEST);
-  if (vitest && vitest !== "0" && vitest !== "false" && vitest !== "off") {
-    return false;
-  }
-  return true;
+  return loadBrowserControlAuthSurface().shouldAutoGenerateBrowserAuth(env);
 }
 
-function hasExplicitNonStringGatewayCredentialForMode(params: {
-  cfg?: OpenClawConfig;
-  mode: "none" | "trusted-proxy";
-}): boolean {
-  const { cfg, mode } = params;
-  const auth = cfg?.gateway?.auth;
-  if (!auth) {
-    return false;
-  }
-  if (mode === "none") {
-    return auth.token != null && typeof auth.token !== "string";
-  }
-  return auth.password != null && typeof auth.password !== "string";
-}
-
-function generateBrowserControlToken(): string {
-  return crypto.randomBytes(24).toString("hex");
-}
-
-async function generateAndPersistBrowserControlToken(params: {
-  cfg: OpenClawConfig;
-  env: NodeJS.ProcessEnv;
-}): Promise<{
-  auth: BrowserControlAuth;
-  generatedToken?: string;
-}> {
-  const token = generateBrowserControlToken();
-  const nextCfg: OpenClawConfig = {
-    ...params.cfg,
-    gateway: {
-      ...params.cfg.gateway,
-      auth: {
-        ...params.cfg.gateway?.auth,
-        token,
-      },
-    },
-  };
-  await writeConfigFile(nextCfg);
-
-  const persistedAuth = resolveBrowserControlAuth(loadConfig(), params.env);
-  if (persistedAuth.token || persistedAuth.password) {
-    return {
-      auth: persistedAuth,
-      generatedToken: persistedAuth.token === token ? token : undefined,
-    };
-  }
-
-  return { auth: { token }, generatedToken: token };
-}
-
-async function generateAndPersistBrowserControlPassword(params: {
-  cfg: OpenClawConfig;
-  env: NodeJS.ProcessEnv;
-}): Promise<{
-  auth: BrowserControlAuth;
-  generatedToken?: string;
-}> {
-  const password = generateBrowserControlToken();
-  const nextCfg: OpenClawConfig = {
-    ...params.cfg,
-    gateway: {
-      ...params.cfg.gateway,
-      auth: {
-        ...params.cfg.gateway?.auth,
-        password,
-      },
-    },
-  };
-  await writeConfigFile(nextCfg);
-
-  const persistedAuth = resolveBrowserControlAuth(loadConfig(), params.env);
-  if (persistedAuth.token || persistedAuth.password) {
-    return {
-      auth: persistedAuth,
-      generatedToken: persistedAuth.password === password ? password : undefined,
-    };
-  }
-
-  return { auth: { password }, generatedToken: password };
-}
-
-export async function ensureBrowserControlAuth(params: {
-  cfg: OpenClawConfig;
-  env?: NodeJS.ProcessEnv;
-}): Promise<{
-  auth: BrowserControlAuth;
-  generatedToken?: string;
-}> {
-  const env = params.env ?? process.env;
-  const auth = resolveBrowserControlAuth(params.cfg, env);
-  if (auth.token || auth.password) {
-    return { auth };
-  }
-  if (!shouldAutoGenerateBrowserAuth(env)) {
-    return { auth };
-  }
-
-  if (params.cfg.gateway?.auth?.mode === "password") {
-    return { auth };
-  }
-
-  const latestCfg = loadConfig();
-  const latestAuth = resolveBrowserControlAuth(latestCfg, env);
-  if (latestAuth.token || latestAuth.password) {
-    return { auth: latestAuth };
-  }
-  if (latestCfg.gateway?.auth?.mode === "password") {
-    return { auth: latestAuth };
-  }
-  const latestMode = latestCfg.gateway?.auth?.mode;
-  if (latestMode === "none" || latestMode === "trusted-proxy") {
-    if (
-      hasExplicitNonStringGatewayCredentialForMode({
-        cfg: latestCfg,
-        mode: latestMode,
-      })
-    ) {
-      return { auth: latestAuth };
-    }
-    if (latestMode === "trusted-proxy") {
-      return await generateAndPersistBrowserControlPassword({ cfg: latestCfg, env });
-    }
-    return await generateAndPersistBrowserControlToken({ cfg: latestCfg, env });
-  }
-
-  const ensured = await ensureGatewayStartupAuth({
-    cfg: latestCfg,
-    env,
-    persist: true,
-  });
-  return {
-    auth: {
-      token: ensured.auth.token,
-      password: ensured.auth.password,
-    },
-    generatedToken: ensured.generatedToken,
-  };
+/** Ensures browser control auth exists, returning any token generated during the call. */
+export async function ensureBrowserControlAuth(
+  params: EnsureBrowserControlAuthParams,
+): Promise<EnsureBrowserControlAuthResult> {
+  return await loadBrowserControlAuthSurface().ensureBrowserControlAuth(params);
 }

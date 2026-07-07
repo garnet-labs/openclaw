@@ -1,3 +1,4 @@
+// Moonshot provider module implements model/runtime integration.
 import {
   buildOpenAiCompatibleVideoRequestBody,
   coerceOpenAiCompatibleVideoText,
@@ -12,11 +13,13 @@ import {
 import {
   assertOkOrThrowHttpError,
   postJsonRequest,
+  readProviderJsonResponse,
   resolveProviderHttpRequestConfig,
 } from "openclaw/plugin-sdk/provider-http";
+import { MOONSHOT_DEFAULT_MODEL_ID } from "./provider-catalog.js";
 
-export const DEFAULT_MOONSHOT_VIDEO_BASE_URL = "https://api.moonshot.ai/v1";
-const DEFAULT_MOONSHOT_VIDEO_MODEL = "kimi-k2.5";
+const DEFAULT_MOONSHOT_VIDEO_BASE_URL = "https://api.moonshot.ai/v1";
+const DEFAULT_MOONSHOT_VIDEO_MODEL = MOONSHOT_DEFAULT_MODEL_ID;
 const DEFAULT_MOONSHOT_VIDEO_PROMPT = "Describe the video.";
 
 export async function describeMoonshotVideo(
@@ -62,7 +65,10 @@ export async function describeMoonshotVideo(
 
   try {
     await assertOkOrThrowHttpError(res, "Moonshot video description failed");
-    const payload = (await res.json()) as OpenAiCompatibleVideoPayload;
+    const payload = await readProviderJsonResponse<OpenAiCompatibleVideoPayload>(
+      res,
+      "Moonshot video description failed",
+    );
     const text = coerceOpenAiCompatibleVideoText(payload);
     if (!text) {
       throw new Error("Moonshot video description response missing content");
@@ -76,7 +82,7 @@ export async function describeMoonshotVideo(
 export const moonshotMediaUnderstandingProvider: MediaUnderstandingProvider = {
   id: "moonshot",
   capabilities: ["image", "video"],
-  defaultModels: { image: "kimi-k2.5", video: DEFAULT_MOONSHOT_VIDEO_MODEL },
+  defaultModels: { image: MOONSHOT_DEFAULT_MODEL_ID, video: DEFAULT_MOONSHOT_VIDEO_MODEL },
   autoPriority: { video: 20 },
   describeImage: describeImageWithModel,
   describeImages: describeImagesWithModel,

@@ -1,10 +1,28 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+// Memory Core tests cover manager cache plugin behavior.
 import {
   closeManagedCacheEntries,
   getOrCreateManagedCacheEntry,
   resolveSingletonManagedCache,
   type ManagedCache,
 } from "./manager-cache.js";
+
+function createDeferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve: ((value: T | PromiseLike<T>) => void) | undefined;
+  let reject: ((reason?: unknown) => void) | undefined;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  if (!resolve || !reject) {
+    throw new Error("Expected deferred callbacks to be initialized");
+  }
+  return { promise, resolve, reject };
+}
 
 type TestEntry = {
   id: string;
@@ -22,16 +40,6 @@ function createEntry(id: string): TestEntry {
   };
 }
 
-function createDeferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
 describe("manager cache", () => {
   const cachesForCleanup: ManagedCache<TestEntry>[] = [];
 
@@ -44,6 +52,25 @@ describe("manager cache", () => {
         }),
       ),
     );
+  });
+
+  it("repairs an invalid singleton cache shape", async () => {
+    const cacheKey = Symbol("openclaw.manager-cache.corrupt-test");
+    (globalThis as Record<PropertyKey, unknown>)[cacheKey] = {};
+
+    const cache = resolveSingletonManagedCache<TestEntry>(cacheKey);
+    cachesForCleanup.push(cache);
+    const entry = await getOrCreateManagedCacheEntry({
+      cache: cache.cache,
+      pending: cache.pending,
+      key: "same",
+      create: async () => createEntry("repaired"),
+    });
+
+    expect(entry.id).toBe("repaired");
+    expect(cache.cache).toBeInstanceOf(Map);
+    expect(cache.pending).toBeInstanceOf(Map);
+    delete (globalThis as Record<PropertyKey, unknown>)[cacheKey];
   });
 
   it("deduplicates concurrent creation for the same cache key", async () => {
@@ -78,7 +105,7 @@ describe("manager cache", () => {
     const first = createEntry("first");
     const second = createEntry("second");
     cachesForCleanup.push(cache);
-    const gate = createDeferred<void>();
+    const gate = createDeferred();
 
     const pendingFirst = getOrCreateManagedCacheEntry({
       cache: cache.cache,

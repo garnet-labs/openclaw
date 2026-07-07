@@ -14,10 +14,7 @@ import (
 const defaultDocChunkMaxBytes = 12000
 const defaultDocChunkPromptBudget = 15000
 
-var (
-	docsFenceRE        = regexp.MustCompile(`^\s*(` + "```" + `|~~~)`)
-	docsComponentTagRE = regexp.MustCompile(`<(/?)([A-Z][A-Za-z0-9]*)\b[^>]*?/?>`)
-)
+var docsComponentTagRE = regexp.MustCompile(`<(/?)([A-Z][A-Za-z0-9]*)\b[^>]*?/?>`)
 
 var docsProtocolTokens = []string{
 	frontmatterTagStart,
@@ -186,6 +183,9 @@ func groupDocBlocks(blocks []string, maxBytes int) [][]string {
 func validateDocChunkTranslation(source, translated string) error {
 	if hasUnexpectedTopLevelProtocolWrapper(source, translated) {
 		return fmt.Errorf("protocol token leaked: top-level wrapper")
+	}
+	if err := validateNoTranslationTranscriptArtifacts(source, translated); err != nil {
+		return err
 	}
 	sourceLower := strings.ToLower(source)
 	translatedLower := strings.ToLower(translated)
@@ -596,10 +596,6 @@ func splitDocBlockSections(block string) []string {
 	return sections
 }
 
-func splitPureFencedDocSection(block string, maxBytes, promptBudget int) ([][]string, bool) {
-	return splitPureFencedDocSectionWithMode(block, maxBytes, promptBudget, false)
-}
-
 func splitPureFencedDocSectionWithMode(block string, maxBytes, promptBudget int, force bool) ([][]string, bool) {
 	lines := strings.SplitAfter(block, "\n")
 	if len(lines) < 2 {
@@ -631,10 +627,6 @@ func splitPureFencedDocSectionWithMode(block string, maxBytes, promptBudget int,
 		groups[index] = []string{opening + joined + closing}
 	}
 	return groups, true
-}
-
-func splitPlainDocSection(text string, maxBytes, promptBudget int) ([][]string, bool) {
-	return splitPlainDocSectionWithMode(text, maxBytes, promptBudget, false)
 }
 
 func splitPlainDocSectionWithMode(text string, maxBytes, promptBudget int, force bool) ([][]string, bool) {

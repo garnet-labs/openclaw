@@ -1,8 +1,15 @@
+/**
+ * Tests auth profile API-key resolution.
+ * Covers token/api-key/OAuth profile compatibility, SecretRefs, and provider
+ * runtime formatting behavior.
+ */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
+import { withEnvAsync } from "../../test-utils/env.js";
 import type { AuthProfileStore } from "./types.js";
 
 vi.mock("../cli-credentials.js", () => ({
+  readClaudeCliCredentialsCached: () => null,
   readCodexCliCredentialsCached: () => null,
   readMiniMaxCliCredentialsCached: () => null,
   resetCliCredentialCachesForTest: () => undefined,
@@ -77,17 +84,7 @@ async function resolveWithConfig(params: {
 }
 
 async function withEnvVar<T>(key: string, value: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env[key];
-  process.env[key] = value;
-  try {
-    return await run();
-  } finally {
-    if (previous === undefined) {
-      delete process.env[key];
-    } else {
-      process.env[key] = previous;
-    }
-  }
+  return await withEnvAsync({ [key]: value }, run);
 }
 
 async function expectResolvedApiKey(params: {
@@ -115,6 +112,10 @@ afterAll(() => {
   vi.doUnmock("../cli-credentials.js");
   vi.doUnmock("../../plugins/provider-runtime.runtime.js");
 });
+
+function createUsableOAuthExpiry(): number {
+  return Date.now() + 30 * 60 * 1000;
+}
 
 describe("resolveApiKeyForProfile config compatibility", () => {
   it("accepts token credentials when config mode is oauth", async () => {
@@ -183,7 +184,7 @@ describe("resolveApiKeyForProfile config compatibility", () => {
           provider: "anthropic",
           access: "access-123",
           refresh: "refresh-123",
-          expires: Date.now() + 60_000,
+          expires: createUsableOAuthExpiry(),
         },
       },
     };
@@ -299,6 +300,26 @@ describe("resolveApiKeyForProfile token expiry handling", () => {
 });
 
 describe("resolveApiKeyForProfile secret refs", () => {
+  it("ignores blank api_key credentials", async () => {
+    const profileId = "openrouter:default";
+    const result = await resolveApiKeyForProfile({
+      cfg: cfgFor(profileId, "openrouter", "api_key"),
+      store: {
+        version: 1,
+        profiles: {
+          [profileId]: {
+            type: "api_key",
+            provider: "openrouter",
+            key: "   ",
+          },
+        },
+      },
+      profileId,
+    });
+
+    expect(result).toBeNull();
+  });
+
   it("resolves api_key keyRef from env", async () => {
     const profileId = "openai:default";
     const previous = process.env.OPENAI_API_KEY;
@@ -330,6 +351,30 @@ describe("resolveApiKeyForProfile secret refs", () => {
         process.env.OPENAI_API_KEY = previous;
       }
     }
+  });
+
+  it("normalizes inline api_key values from auth profiles before header use", async () => {
+    const profileId = "openrouter:masked";
+    const result = await resolveApiKeyForProfile({
+      cfg: cfgFor(profileId, "openrouter", "api_key"),
+      store: {
+        version: 1,
+        profiles: {
+          [profileId]: {
+            type: "api_key",
+            provider: "openrouter",
+            key: " sk-or-\u202650ec ",
+          },
+        },
+      },
+      profileId,
+    });
+
+    expect(result).toEqual({
+      apiKey: "sk-or-50ec", // pragma: allowlist secret
+      provider: "openrouter",
+      email: undefined,
+    });
   });
 
   it("resolves token tokenRef from env", async () => {

@@ -1,21 +1,29 @@
+// Msteams plugin module implements graph behavior.
+import {
+  readProviderJsonArrayFieldResponse,
+  readProviderJsonResponse,
+} from "openclaw/plugin-sdk/provider-http";
+import { fetchWithSsrFGuard, type SsrFPolicy } from "openclaw/plugin-sdk/ssrf-runtime";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
-} from "openclaw/plugin-sdk/text-runtime";
-import { fetchWithSsrFGuard, type SsrFPolicy } from "../../runtime-api.js";
+  uniqueStrings,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { getMSTeamsRuntime } from "../runtime.js";
 import { ensureUserAgentHeader } from "../user-agent.js";
 import { downloadMSTeamsAttachments } from "./download.js";
 import { downloadAndStoreMSTeamsRemoteMedia } from "./remote-media.js";
 import {
   applyAuthorizationHeaderForUrl,
+  encodeGraphShareId,
   GRAPH_ROOT,
-  estimateBase64DecodedBytes,
   inferPlaceholder,
   readNestedString,
   isUrlAllowed,
+  type MSTeamsAttachmentDownloadLogger,
   type MSTeamsAttachmentFetchPolicy,
+  type MSTeamsAttachmentResolveFn,
   normalizeContentType,
   resolveMediaSsrfPolicy,
   resolveAttachmentFetchPolicy,
@@ -25,6 +33,7 @@ import {
 import type {
   MSTeamsAccessTokenProvider,
   MSTeamsAttachmentLike,
+  MSTeamsGraphMediaLogger,
   MSTeamsGraphMediaResult,
   MSTeamsInboundMedia,
 } from "./types.js";
@@ -32,7 +41,6 @@ import type {
 type GraphHostedContent = {
   id?: string | null;
   contentType?: string | null;
-  contentBytes?: string | null;
 };
 
 type GraphAttachment = {
@@ -98,7 +106,7 @@ export function buildMSTeamsGraphMessageUrls(params: {
         `${GRAPH_ROOT}/teams/${encodeURIComponent(teamId)}/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(candidate)}`,
       );
     }
-    return Array.from(new Set(urls));
+    return uniqueStrings(urls);
   }
 
   const chatId = params.conversationId?.trim() || readNestedString(params.channelData, ["chatId"]);
@@ -112,15 +120,15 @@ export function buildMSTeamsGraphMessageUrls(params: {
     (candidate) =>
       `${GRAPH_ROOT}/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(candidate)}`,
   );
-  return Array.from(new Set(urls));
+  return uniqueStrings(urls);
 }
 
-async function fetchGraphCollection<T>(params: {
+async function fetchGraphCollection(params: {
   url: string;
   accessToken: string;
   fetchFn?: typeof fetch;
   ssrfPolicy?: SsrFPolicy;
-}): Promise<{ status: number; items: T[] }> {
+}): Promise<{ status: number; items: unknown[] }> {
   const fetchFn = params.fetchFn ?? fetch;
   const { response, release } = await fetchWithSsrFGuard({
     url: params.url,
@@ -137,8 +145,12 @@ async function fetchGraphCollection<T>(params: {
       return { status, items: [] };
     }
     try {
-      const data = (await response.json()) as { value?: T[] };
-      return { status, items: Array.isArray(data.value) ? data.value : [] };
+      const items = await readProviderJsonArrayFieldResponse(
+        response,
+        "MS Teams Graph collection",
+        "value",
+      );
+      return { status, items };
     } catch {
       return { status, items: [] };
     }
@@ -176,85 +188,60 @@ async function downloadGraphHostedContent(params: {
   fetchFn?: typeof fetch;
   preserveFilenames?: boolean;
   ssrfPolicy?: SsrFPolicy;
+  logger?: MSTeamsAttachmentDownloadLogger;
 }): Promise<{ media: MSTeamsInboundMedia[]; status: number; count: number }> {
-  const hosted = await fetchGraphCollection<GraphHostedContent>({
+  const hosted = (await fetchGraphCollection({
     url: `${params.messageUrl}/hostedContents`,
     accessToken: params.accessToken,
     fetchFn: params.fetchFn,
     ssrfPolicy: params.ssrfPolicy,
-  });
+  })) as { status: number; items: GraphHostedContent[] };
   if (hosted.items.length === 0) {
     return { media: [], status: hosted.status, count: 0 };
   }
 
   const out: MSTeamsInboundMedia[] = [];
   for (const item of hosted.items) {
-    const contentBytes = typeof item.contentBytes === "string" ? item.contentBytes : "";
-    let buffer: Buffer;
-    if (contentBytes) {
-      if (estimateBase64DecodedBytes(contentBytes) > params.maxBytes) {
-        continue;
-      }
-      try {
-        buffer = Buffer.from(contentBytes, "base64");
-      } catch {
-        continue;
-      }
-    } else if (item.id) {
-      // contentBytes not inline — fetch from the individual $value endpoint.
-      try {
-        const valueUrl = `${params.messageUrl}/hostedContents/${encodeURIComponent(item.id)}/$value`;
-        const { response: valRes, release } = await fetchWithSsrFGuard({
-          url: valueUrl,
-          fetchImpl: params.fetchFn ?? fetch,
-          init: {
-            headers: ensureUserAgentHeader({ Authorization: `Bearer ${params.accessToken}` }),
-          },
-          policy: params.ssrfPolicy,
-          auditContext: "msteams.graph.hostedContent.value",
-        });
-        try {
-          if (!valRes.ok) {
-            continue;
-          }
-          // Check Content-Length before buffering to avoid RSS spikes on large files.
-          const cl = valRes.headers.get("content-length");
-          if (cl && Number(cl) > params.maxBytes) {
-            continue;
-          }
-          const ab = await valRes.arrayBuffer();
-          buffer = Buffer.from(ab);
-        } finally {
-          await release();
-        }
-      } catch {
-        continue;
-      }
-    } else {
+    if (!item.id) {
       continue;
     }
-    if (buffer.byteLength > params.maxBytes) {
-      continue;
-    }
-    const mime = await getMSTeamsRuntime().media.detectMime({
-      buffer,
-      headerMime: item.contentType ?? undefined,
-    });
-    // Download any file type, not just images
+
+    // Graph's list API returns metadata only; hosted bytes live at `$value`.
+    // Keep the JSON cap independent from the configured binary media limit.
     try {
-      const saved = await getMSTeamsRuntime().channel.media.saveMediaBuffer(
-        buffer,
-        mime ?? item.contentType ?? undefined,
-        "inbound",
-        params.maxBytes,
-      );
-      out.push({
-        path: saved.path,
-        contentType: saved.contentType,
-        placeholder: inferPlaceholder({ contentType: saved.contentType }),
+      const valueUrl = `${params.messageUrl}/hostedContents/${encodeURIComponent(item.id)}/$value`;
+      const { response: valRes, release } = await fetchWithSsrFGuard({
+        url: valueUrl,
+        fetchImpl: params.fetchFn ?? fetch,
+        init: {
+          headers: ensureUserAgentHeader({ Authorization: `Bearer ${params.accessToken}` }),
+        },
+        policy: params.ssrfPolicy,
+        auditContext: "msteams.graph.hostedContent.value",
       });
-    } catch {
-      // Ignore save failures.
+      try {
+        if (!valRes.ok) {
+          continue;
+        }
+        const saved = await getMSTeamsRuntime().channel.media.saveResponseMedia(valRes, {
+          sourceUrl: valueUrl,
+          maxBytes: params.maxBytes,
+          fallbackContentType: item.contentType ?? undefined,
+          subdir: "inbound",
+        });
+        out.push({
+          path: saved.path,
+          contentType: saved.contentType,
+          placeholder: inferPlaceholder({ contentType: saved.contentType }),
+        });
+      } finally {
+        await release();
+      }
+    } catch (err) {
+      params.logger?.warn?.("msteams graph hostedContent value fetch failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      continue;
     }
   }
 
@@ -268,8 +255,14 @@ export async function downloadMSTeamsGraphMedia(params: {
   allowHosts?: string[];
   authAllowHosts?: string[];
   fetchFn?: typeof fetch;
+  fetchFnSupportsDispatcher?: boolean;
+  resolveFn?: MSTeamsAttachmentResolveFn;
   /** When true, embeds original filename in stored path for later extraction. */
   preserveFilenames?: boolean;
+  /** Optional logger used to surface Graph/SharePoint fetch errors. */
+  logger?: MSTeamsAttachmentDownloadLogger;
+  /** Back-compat diagnostic logger used by older tests/callers. */
+  log?: MSTeamsGraphMediaLogger;
 }): Promise<MSTeamsGraphMediaResult> {
   if (!params.messageUrl || !params.tokenProvider) {
     return { media: [] };
@@ -280,17 +273,27 @@ export async function downloadMSTeamsGraphMedia(params: {
   });
   const ssrfPolicy = resolveMediaSsrfPolicy(policy.allowHosts);
   const messageUrl = params.messageUrl;
+  const debugLog =
+    params.log ?? (params.logger as MSTeamsGraphMediaLogger | undefined) ?? undefined;
   let accessToken: string;
   try {
     accessToken = await params.tokenProvider.getAccessToken("https://graph.microsoft.com");
-  } catch {
+  } catch (err) {
+    debugLog?.debug?.("graph media token acquisition failed", {
+      messageUrl,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    params.logger?.warn?.("msteams graph token acquisition failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
     return { media: [], messageUrl, tokenError: true };
   }
 
-  // Fetch the full message to get SharePoint file attachments (for group chats)
   const fetchFn = params.fetchFn ?? fetch;
   const sharePointMedia: MSTeamsInboundMedia[] = [];
   const downloadedReferenceUrls = new Set<string>();
+  let messageAttachments: GraphAttachment[] = [];
+  let messageStatus: number | undefined;
   try {
     const { response: msgRes, release } = await fetchWithSsrFGuard({
       url: messageUrl,
@@ -302,33 +305,49 @@ export async function downloadMSTeamsGraphMedia(params: {
       auditContext: "msteams.graph.message",
     });
     try {
+      messageStatus = msgRes.status;
       if (msgRes.ok) {
-        const msgData = (await msgRes.json()) as {
+        let msgData: {
           body?: { content?: string; contentType?: string };
-          attachments?: Array<{
-            id?: string;
-            contentUrl?: string;
-            contentType?: string;
-            name?: string;
-          }>;
+          attachments?: GraphAttachment[];
         };
+        try {
+          msgData = await readProviderJsonResponse<typeof msgData>(
+            msgRes,
+            "MS Teams Graph message",
+          );
+        } catch (err) {
+          debugLog?.debug?.("graph media message parse failed", {
+            messageUrl,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          params.logger?.warn?.("msteams graph message parse failed", {
+            error: err instanceof Error ? err.message : String(err),
+            messageUrl,
+          });
+          msgData = {};
+        }
+        messageAttachments = Array.isArray(msgData.attachments) ? msgData.attachments : [];
 
-        // Extract SharePoint file attachments (contentType: "reference")
-        // Download any file type, not just images
-        const spAttachments = (msgData.attachments ?? []).filter(
+        const spAttachments = messageAttachments.filter(
           (a) => a.contentType === "reference" && a.contentUrl && a.name,
         );
         for (const att of spAttachments) {
           const name = att.name ?? "file";
+          const shareUrl = att.contentUrl ?? "";
+          if (!shareUrl) {
+            continue;
+          }
 
           try {
-            // SharePoint URLs need to be accessed via Graph shares API
-            const shareUrl = att.contentUrl!;
-            if (!isUrlAllowed(shareUrl, policy.allowHosts)) {
+            const sharesUrl = `${GRAPH_ROOT}/shares/${encodeGraphShareId(shareUrl)}/driveItem/content`;
+            if (!isUrlAllowed(sharesUrl, policy.allowHosts)) {
+              debugLog?.debug?.("graph media sharepoint url not in allowHosts", {
+                messageUrl,
+                sharesUrl,
+              });
               continue;
             }
-            const encodedUrl = Buffer.from(shareUrl).toString("base64url");
-            const sharesUrl = `${GRAPH_ROOT}/shares/u!${encodedUrl}/driveItem/content`;
 
             const media = await downloadAndStoreMSTeamsRemoteMedia({
               url: sharesUrl,
@@ -337,6 +356,7 @@ export async function downloadMSTeamsGraphMedia(params: {
               contentTypeHint: "application/octet-stream",
               preserveFilenames: params.preserveFilenames,
               ssrfPolicy,
+              useDirectFetch: true,
               fetchImpl: async (input, init) => {
                 const requestUrl = resolveRequestUrl(input);
                 const headers = ensureUserAgentHeader(init?.headers);
@@ -350,25 +370,41 @@ export async function downloadMSTeamsGraphMedia(params: {
                   url: requestUrl,
                   policy,
                   fetchFn,
+                  fetchFnSupportsDispatcher: params.fetchFnSupportsDispatcher,
                   requestInit: {
                     ...init,
                     headers,
                   },
+                  resolveFn: params.resolveFn,
                 });
               },
             });
             sharePointMedia.push(media);
             downloadedReferenceUrls.add(shareUrl);
-          } catch {
-            // Ignore SharePoint download failures.
+          } catch (err) {
+            params.logger?.warn?.("msteams SharePoint reference download failed", {
+              error: err instanceof Error ? err.message : String(err),
+              name,
+            });
           }
         }
+      } else {
+        debugLog?.debug?.("graph media message fetch not ok", {
+          messageUrl,
+          status: messageStatus,
+        });
       }
     } finally {
       await release();
     }
-  } catch {
-    // Ignore message fetch failures.
+  } catch (err) {
+    debugLog?.debug?.("graph media message fetch failed", {
+      messageUrl,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    params.logger?.warn?.("msteams graph message fetch failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 
   const hosted = await downloadGraphHostedContent({
@@ -378,16 +414,10 @@ export async function downloadMSTeamsGraphMedia(params: {
     fetchFn: params.fetchFn,
     preserveFilenames: params.preserveFilenames,
     ssrfPolicy,
+    logger: params.logger,
   });
 
-  const attachments = await fetchGraphCollection<GraphAttachment>({
-    url: `${messageUrl}/attachments`,
-    accessToken,
-    fetchFn: params.fetchFn,
-    ssrfPolicy,
-  });
-
-  const normalizedAttachments = attachments.items.map(normalizeGraphAttachment);
+  const normalizedAttachments = messageAttachments.map(normalizeGraphAttachment);
   const filteredAttachments =
     sharePointMedia.length > 0
       ? normalizedAttachments.filter((att) => {
@@ -402,22 +432,33 @@ export async function downloadMSTeamsGraphMedia(params: {
           return !downloadedReferenceUrls.has(url);
         })
       : normalizedAttachments;
-  const attachmentMedia = await downloadMSTeamsAttachments({
-    attachments: filteredAttachments,
-    maxBytes: params.maxBytes,
-    tokenProvider: params.tokenProvider,
-    allowHosts: policy.allowHosts,
-    authAllowHosts: policy.authAllowHosts,
-    fetchFn: params.fetchFn,
-    preserveFilenames: params.preserveFilenames,
-  });
+  let attachmentMedia: MSTeamsInboundMedia[] = [];
+  try {
+    attachmentMedia = await downloadMSTeamsAttachments({
+      attachments: filteredAttachments,
+      maxBytes: params.maxBytes,
+      tokenProvider: params.tokenProvider,
+      allowHosts: policy.allowHosts,
+      authAllowHosts: policy.authAllowHosts,
+      fetchFn: params.fetchFn,
+      fetchFnSupportsDispatcher: params.fetchFnSupportsDispatcher,
+      resolveFn: params.resolveFn,
+      preserveFilenames: params.preserveFilenames,
+      logger: params.logger,
+    });
+  } catch (err) {
+    params.logger?.warn?.("msteams graph attachment download failed", {
+      error: err instanceof Error ? err.message : String(err),
+      messageUrl,
+    });
+  }
 
   return {
     media: [...sharePointMedia, ...hosted.media, ...attachmentMedia],
     hostedCount: hosted.count,
     attachmentCount: filteredAttachments.length + sharePointMedia.length,
     hostedStatus: hosted.status,
-    attachmentStatus: attachments.status,
+    attachmentStatus: messageStatus,
     messageUrl,
   };
 }

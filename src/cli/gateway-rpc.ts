@@ -1,20 +1,24 @@
+// Lazy gateway RPC facade and shared Commander options for CLI subcommands.
 import type { Command } from "commander";
-
-export type GatewayRpcOpts = {
-  url?: string;
-  token?: string;
-  timeout?: string;
-  expectFinal?: boolean;
-  json?: boolean;
-};
+import type {
+  GatewayClientMode,
+  GatewayClientName,
+} from "../../packages/gateway-protocol/src/client-info.js";
+import type { OperatorScope } from "../gateway/operator-scopes.js";
+import type { DeviceIdentity } from "../infra/device-identity.js";
+import { createLazyImportLoader } from "../shared/lazy-promise.js";
+import type { GatewayRpcOpts } from "./gateway-rpc.types.js";
+export type { GatewayRpcOpts } from "./gateway-rpc.types.js";
 
 type GatewayRpcRuntimeModule = typeof import("./gateway-rpc.runtime.js");
 
-let gatewayRpcRuntimePromise: Promise<GatewayRpcRuntimeModule> | undefined;
+const gatewayRpcRuntimeLoader = createLazyImportLoader<GatewayRpcRuntimeModule>(
+  () => import("./gateway-rpc.runtime.js"),
+);
 
 async function loadGatewayRpcRuntime(): Promise<GatewayRpcRuntimeModule> {
-  gatewayRpcRuntimePromise ??= import("./gateway-rpc.runtime.js");
-  return gatewayRpcRuntimePromise;
+  // Keep gateway transport/runtime imports out of help and shell completion startup.
+  return gatewayRpcRuntimeLoader.load();
 }
 
 export function addGatewayClientOptions(cmd: Command) {
@@ -29,7 +33,15 @@ export async function callGatewayFromCli(
   method: string,
   opts: GatewayRpcOpts,
   params?: unknown,
-  extra?: { expectFinal?: boolean; progress?: boolean },
+  extra?: {
+    clientName?: GatewayClientName;
+    mode?: GatewayClientMode;
+    deviceIdentity?: DeviceIdentity | null;
+    signal?: AbortSignal;
+    expectFinal?: boolean;
+    progress?: boolean;
+    scopes?: OperatorScope[];
+  },
 ) {
   const runtime = await loadGatewayRpcRuntime();
   return await runtime.callGatewayFromCliRuntime(method, opts, params, extra);

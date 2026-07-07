@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Generates Swift constants for the host environment security policy.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +38,14 @@ const generated = `// Generated file. Do not edit directly.
 import Foundation
 
 enum HostEnvSecurityPolicy {
+    static let blockedInheritedKeys: Set<String> = [
+${renderSwiftStringArray(policy.blockedInheritedKeys)}
+    ]
+
+    static let blockedInheritedPrefixes: [String] = [
+${renderSwiftStringArray(policy.blockedInheritedPrefixes)}
+    ]
+
     static let blockedKeys: Set<String> = [
 ${renderSwiftStringArray(policy.blockedKeys)}
     ]

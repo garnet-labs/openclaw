@@ -1,3 +1,4 @@
+/** Builds the ACP available-command list exposed to compatible clients. */
 import type { AvailableCommand } from "@agentclientprotocol/sdk";
 import { getChatCommands } from "../auto-reply/commands-registry.data.js";
 
@@ -15,7 +16,7 @@ const BASE_AVAILABLE_COMMANDS: AvailableCommand[] = [
   { name: "subagents", description: "List or manage sub-agents." },
   { name: "config", description: "Read or write config (owner-only)." },
   { name: "debug", description: "Set runtime-only overrides (owner-only)." },
-  { name: "usage", description: "Toggle usage footer (off|tokens|full)." },
+  { name: "usage", description: "Toggle usage footer (off|tokens|full|reset). 'reset'/'inherit'/'clear'/'default' clears the session override to re-inherit the configured default." },
   { name: "stop", description: "Stop the current run." },
   { name: "restart", description: "Restart the gateway (if enabled)." },
   { name: "activation", description: "Set group activation (mention|always)." },
@@ -27,6 +28,7 @@ const BASE_AVAILABLE_COMMANDS: AvailableCommand[] = [
     description: "Set thinking level (off|minimal|low|medium|high|xhigh).",
   },
   { name: "verbose", description: "Set verbose mode (on|full|off)." },
+  { name: "trace", description: "Set plugin trace mode (on|off)." },
   { name: "reasoning", description: "Toggle reasoning output (on|off|stream)." },
   { name: "elevated", description: "Toggle elevated mode (on|off)." },
   { name: "model", description: "Select a model (list|status|<name>)." },
@@ -44,6 +46,7 @@ function listDockAvailableCommands(): AvailableCommand[] {
     }));
 }
 
+/** Returns static ACP commands plus plugin-registered dock commands. */
 export function getAvailableCommands(): AvailableCommand[] {
   return [...BASE_AVAILABLE_COMMANDS, ...listDockAvailableCommands()];
 }

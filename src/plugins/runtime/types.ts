@@ -1,7 +1,10 @@
-import type { PluginRuntimeChannel } from "./types-channel.js";
+// Plugin runtime types describe activated plugin capabilities exposed to core execution.
+import type { OperatorScope } from "../../gateway/operator-scopes.js";
 import type { PluginRuntimeCore, RuntimeLogger } from "./types-core.js";
 
 export type { RuntimeLogger };
+
+type PluginRuntimeChannel = import("./types-channel.js").PluginRuntimeChannel;
 
 // ── Subagent runtime types ──────────────────────────────────────────
 
@@ -12,8 +15,16 @@ export type SubagentRunParams = {
   model?: string;
   extraSystemPrompt?: string;
   lane?: string;
+  lightContext?: boolean;
   deliver?: boolean;
   idempotencyKey?: string;
+  cwd?: string;
+};
+
+export type PluginManagedWorktree = {
+  id: string;
+  path: string;
+  branch: string;
 };
 
 export type SubagentRunResult = {
@@ -50,6 +61,31 @@ export type SubagentDeleteSessionParams = {
   deleteTranscript?: boolean;
 };
 
+export type RuntimeNodeListParams = {
+  connected?: boolean;
+};
+
+export type RuntimeNodeListResult = {
+  nodes: Array<{
+    nodeId: string;
+    displayName?: string;
+    remoteIp?: string;
+    connected?: boolean;
+    caps?: string[];
+    commands?: string[];
+  }>;
+};
+
+export type RuntimeNodeInvokeParams = {
+  nodeId: string;
+  command: string;
+  params?: unknown;
+  timeoutMs?: number;
+  idempotencyKey?: string;
+  /** Requested Gateway scopes. Honored only for bundled or trusted official plugins. */
+  scopes?: OperatorScope[];
+};
+
 /** Trusted in-process runtime surface injected into native plugins. */
 export type PluginRuntime = PluginRuntimeCore & {
   subagent: {
@@ -62,5 +98,26 @@ export type PluginRuntime = PluginRuntimeCore & {
     getSession: (params: SubagentGetSessionParams) => Promise<SubagentGetSessionResult>;
     deleteSession: (params: SubagentDeleteSessionParams) => Promise<void>;
   };
+  nodes: {
+    list: (params?: RuntimeNodeListParams) => Promise<RuntimeNodeListResult>;
+    invoke: (params: RuntimeNodeInvokeParams) => Promise<unknown>;
+  };
+  worktrees: {
+    create: (params: {
+      repoRoot: string;
+      name: string;
+      baseRef?: string;
+      ownerKind: "workboard";
+      ownerId: string;
+    }) => Promise<PluginManagedWorktree>;
+    release: (params: { path: string }) => Promise<void>;
+    removeIfLossless: (params: { path: string }) => Promise<boolean>;
+  };
   channel: PluginRuntimeChannel;
+};
+
+export type CreatePluginRuntimeOptions = {
+  subagent?: PluginRuntime["subagent"];
+  nodes?: PluginRuntime["nodes"];
+  allowGatewaySubagentBinding?: boolean;
 };

@@ -1,13 +1,31 @@
 package ai.openclaw.app.ui.chat
 
+import ai.openclaw.app.GatewayAgentSummary
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import kotlinx.coroutines.runBlocking
 
 class ChatSheetContentTest {
+  @Test
+  fun agentChipUsesEmojiAndFallsBackToId() {
+    assertEquals(
+      "🦾 Scout",
+      chatAgentChipText(GatewayAgentSummary(id = "scout", name = "Scout", emoji = " 🦾 ")),
+    )
+    assertEquals(
+      "ops",
+      chatAgentChipText(GatewayAgentSummary(id = "ops", name = " ", emoji = null)),
+    )
+  }
+
+  @Test
+  fun agentSelectorUsesCanonicalMainSession() {
+    assertEquals("scout", selectedChatAgentId("agent:scout:node-phone", "main"))
+    assertEquals("main", selectedChatAgentId("main", "main"))
+  }
+
   @Test
   fun resolvesPendingAssistantAutoSendOnlyWhenChatIsReady() {
     assertNull(
@@ -35,38 +53,41 @@ class ChatSheetContentTest {
   }
 
   @Test
-  fun keepsPendingAssistantAutoSendWhenDispatchRejected() = runBlocking {
-    var dispatchedPrompt: String? = null
-
-    val consumed =
-      dispatchPendingAssistantAutoSend(
-        pendingPrompt = "summarize mail",
-        healthOk = true,
-        pendingRunCount = 0,
-      ) { prompt ->
-        dispatchedPrompt = prompt
-        false
-      }
-
-    assertFalse(consumed)
-    assertEquals("summarize mail", dispatchedPrompt)
+  fun initialChatLoadUsesMainWhenNoSessionIsSelected() {
+    assertEquals(
+      "agent:ops:device",
+      resolveInitialChatLoadSessionKey(
+        sessionKey = "main",
+        mainSessionKey = "agent:ops:device",
+      ),
+    )
   }
 
   @Test
-  fun clearsPendingAssistantAutoSendOnlyAfterAcceptedDispatch() = runBlocking {
-    var dispatchedPrompt: String? = null
+  fun initialChatLoadPreservesSelectedSession() {
+    assertNull(
+      resolveInitialChatLoadSessionKey(
+        sessionKey = "session:history",
+        mainSessionKey = "agent:ops:device",
+      ),
+    )
+  }
 
-    val consumed =
-      dispatchPendingAssistantAutoSend(
-        pendingPrompt = "summarize mail",
+  @Test
+  fun healthyEmptyChatShowsStarterStateInsteadOfLoadingPlaceholder() {
+    assertFalse(
+      showChatLoadingPlaceholder(
+        historyLoading = true,
         healthOk = true,
-        pendingRunCount = 0,
-      ) { prompt ->
-        dispatchedPrompt = prompt
-        true
-      }
-
-    assertTrue(consumed)
-    assertEquals("summarize mail", dispatchedPrompt)
+        gatewayOffline = false,
+      ),
+    )
+    assertTrue(
+      showChatLoadingPlaceholder(
+        historyLoading = true,
+        healthOk = false,
+        gatewayOffline = false,
+      ),
+    )
   }
 }

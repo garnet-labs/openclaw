@@ -1,3 +1,4 @@
+// Tests agent runner session reset cleanup and restart behavior.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,43 +8,19 @@ import {
   resetReplyRunSession,
   setAgentRunnerSessionResetTestDeps,
 } from "./agent-runner-session-reset.js";
-import type { FollowupRun } from "./queue.js";
+import { createTestFollowupRun, writeTestSessionStore } from "./agent-runner.test-fixtures.js";
 
 const refreshQueuedFollowupSessionMock = vi.fn();
 const errorMock = vi.fn();
 
-function createFollowupRun(): FollowupRun {
-  return {
-    prompt: "hello",
-    summaryLine: "hello",
-    enqueuedAt: Date.now(),
-    run: {
-      sessionId: "session",
-      sessionKey: "main",
-      messageProvider: "whatsapp",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp",
-      config: {},
-      skillsSnapshot: {},
-      provider: "anthropic",
-      model: "claude",
-      thinkLevel: "low",
-      verboseLevel: "off",
-      elevatedLevel: "off",
-      bashElevated: { enabled: false, allowed: false, defaultLevel: "off" },
-      timeoutMs: 1_000,
-      blockReplyBreak: "message_end",
-    },
-  } as unknown as FollowupRun;
-}
-
-async function writeSessionStore(
-  storePath: string,
-  sessionKey: string,
-  entry: SessionEntry,
-): Promise<void> {
-  await fs.mkdir(path.dirname(storePath), { recursive: true });
-  await fs.writeFile(storePath, JSON.stringify({ [sessionKey]: entry }, null, 2), "utf8");
+async function expectPathMissing(targetPath: string): Promise<void> {
+  let accessError: NodeJS.ErrnoException | undefined;
+  try {
+    await fs.access(targetPath);
+  } catch (error) {
+    accessError = error as NodeJS.ErrnoException;
+  }
+  expect(accessError?.code).toBe("ENOENT");
 }
 
 describe("resetReplyRunSession", () => {
@@ -74,9 +51,36 @@ describe("resetReplyRunSession", () => {
       modelProvider: "qwencode",
       model: "qwen",
       contextTokens: 123,
+      contextBudgetStatus: {
+        schemaVersion: 1,
+        source: "pre-prompt-estimate",
+        updatedAt: 1,
+        provider: "qwencode",
+        model: "qwen",
+        route: "compact_then_truncate",
+        shouldCompact: true,
+        estimatedPromptTokens: 120_000,
+        contextTokenBudget: 80_000,
+        promptBudgetBeforeReserve: 70_000,
+        reserveTokens: 10_000,
+        effectiveReserveTokens: 10_000,
+        remainingPromptBudgetTokens: 0,
+        overflowTokens: 50_000,
+        toolResultReducibleChars: 0,
+        messageCount: 10,
+        unwindowedMessageCount: 10,
+        sessionId: "session",
+      },
       fallbackNoticeSelectedModel: "anthropic/claude",
       fallbackNoticeActiveModel: "openai/gpt",
       fallbackNoticeReason: "rate limit",
+      compactionCount: 5,
+      memoryFlushAt: 123,
+      memoryFlushCompactionCount: 4,
+      memoryFlushContextHash: "stale-context",
+      memoryFlushFailureCount: 3,
+      memoryFlushLastFailedAt: 456,
+      memoryFlushLastFailureError: "provider crashed",
       systemPromptReport: {
         source: "run",
         generatedAt: 1,
@@ -87,8 +91,8 @@ describe("resetReplyRunSession", () => {
       },
     };
     const sessionStore = { main: sessionEntry };
-    const followupRun = createFollowupRun();
-    await writeSessionStore(storePath, "main", sessionEntry);
+    const followupRun = createTestFollowupRun();
+    await writeTestSessionStore(storePath, "main", sessionEntry);
 
     let activeSessionEntry: SessionEntry | undefined = sessionEntry;
     let isNewSession = false;
@@ -118,9 +122,17 @@ describe("resetReplyRunSession", () => {
     expect(activeSessionEntry?.modelProvider).toBeUndefined();
     expect(activeSessionEntry?.model).toBeUndefined();
     expect(activeSessionEntry?.contextTokens).toBeUndefined();
+    expect(activeSessionEntry?.contextBudgetStatus).toBeUndefined();
     expect(activeSessionEntry?.fallbackNoticeSelectedModel).toBeUndefined();
     expect(activeSessionEntry?.fallbackNoticeActiveModel).toBeUndefined();
     expect(activeSessionEntry?.fallbackNoticeReason).toBeUndefined();
+    expect(activeSessionEntry?.compactionCount).toBe(0);
+    expect(activeSessionEntry?.memoryFlushAt).toBeUndefined();
+    expect(activeSessionEntry?.memoryFlushCompactionCount).toBeUndefined();
+    expect(activeSessionEntry?.memoryFlushContextHash).toBeUndefined();
+    expect(activeSessionEntry?.memoryFlushFailureCount).toBeUndefined();
+    expect(activeSessionEntry?.memoryFlushLastFailedAt).toBeUndefined();
+    expect(activeSessionEntry?.memoryFlushLastFailureError).toBeUndefined();
     expect(activeSessionEntry?.systemPromptReport).toBeUndefined();
     expect(refreshQueuedFollowupSessionMock).toHaveBeenCalledWith({
       key: "main",
@@ -134,7 +146,12 @@ describe("resetReplyRunSession", () => {
       main: SessionEntry;
     };
     expect(persisted.main.sessionId).toBe(activeSessionEntry?.sessionId);
+    expect(persisted.main.contextBudgetStatus).toBeUndefined();
     expect(persisted.main.fallbackNoticeReason).toBeUndefined();
+    expect(persisted.main.compactionCount).toBe(0);
+    expect(persisted.main.memoryFlushFailureCount).toBeUndefined();
+    expect(persisted.main.memoryFlushLastFailedAt).toBeUndefined();
+    expect(persisted.main.memoryFlushLastFailureError).toBeUndefined();
   });
 
   it("cleans up the old transcript when requested", async () => {
@@ -147,7 +164,7 @@ describe("resetReplyRunSession", () => {
       sessionFile: oldTranscriptPath,
     };
     const sessionStore = { main: sessionEntry };
-    await writeSessionStore(storePath, "main", sessionEntry);
+    await writeTestSessionStore(storePath, "main", sessionEntry);
 
     await resetReplyRunSession({
       options: {
@@ -160,11 +177,48 @@ describe("resetReplyRunSession", () => {
       activeSessionEntry: sessionEntry,
       activeSessionStore: sessionStore,
       storePath,
-      followupRun: createFollowupRun(),
+      followupRun: createTestFollowupRun(),
       onActiveSessionEntry: () => {},
       onNewSession: () => {},
     });
 
-    await expect(fs.access(oldTranscriptPath)).rejects.toThrow();
+    await expectPathMissing(oldTranscriptPath);
+  });
+
+  it("preserves the old transcript while still rotating when cleanup is disabled", async () => {
+    const storePath = path.join(rootDir, "sessions.json");
+    const oldTranscriptPath = path.join(rootDir, "old-session.jsonl");
+    await fs.writeFile(oldTranscriptPath, "old", "utf8");
+    const sessionEntry: SessionEntry = {
+      sessionId: "old-session",
+      updatedAt: 1,
+      sessionFile: oldTranscriptPath,
+    };
+    const sessionStore = { main: sessionEntry };
+    await writeTestSessionStore(storePath, "main", sessionEntry);
+
+    let rotatedSessionId: string | undefined;
+    await resetReplyRunSession({
+      options: {
+        failureLabel: "memory flush exhaustion",
+        cleanupTranscripts: false,
+        buildLogMessage: (next) => `reset ${next}`,
+      },
+      sessionKey: "main",
+      queueKey: "main",
+      activeSessionEntry: sessionEntry,
+      activeSessionStore: sessionStore,
+      storePath,
+      followupRun: createTestFollowupRun(),
+      onActiveSessionEntry: (entry) => {
+        rotatedSessionId = entry.sessionId;
+      },
+      onNewSession: () => {},
+    });
+
+    // Rotation still happens, but the old transcript stays available for recovery.
+    expect(rotatedSessionId).toBeDefined();
+    expect(rotatedSessionId).not.toBe("old-session");
+    await fs.access(oldTranscriptPath);
   });
 });

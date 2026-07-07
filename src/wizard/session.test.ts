@@ -1,3 +1,4 @@
+// Wizard session tests cover session creation and state transitions.
 import { describe, expect, test } from "vitest";
 import { WizardSession } from "./session.js";
 
@@ -47,6 +48,23 @@ describe("WizardSession", () => {
     expect(done.status).toBe("done");
   });
 
+  test("plain output is a client note with plain format", async () => {
+    const session = new WizardSession(async (prompter) => {
+      await prompter.plain?.('{"ok":true}');
+    });
+
+    const first = await session.next();
+    if (!first.step) {
+      throw new Error("expected plain note");
+    }
+    expect(first.step.type).toBe("note");
+    expect(first.step.message).toBe('{"ok":true}');
+    expect(first.step.format).toBe("plain");
+    await session.answer(first.step.id, null);
+    const done = await session.next();
+    expect(done.done).toBe(true);
+  });
+
   test("invalid answers throw", async () => {
     const session = noteRunner();
     const first = await session.next();
@@ -55,6 +73,49 @@ describe("WizardSession", () => {
       throw new Error("expected first step");
     }
     await session.answer(first.step.id, null);
+  });
+
+  test("keeps a validated text step pending after an invalid answer", async () => {
+    const session = new WizardSession(async (prompter) => {
+      await prompter.text({
+        message: "Port",
+        validate: (value) => (value === "18789" ? undefined : "Enter the expected port"),
+      });
+    });
+
+    const first = await session.next();
+    if (!first.step) {
+      throw new Error("expected text step");
+    }
+    await expect(session.answer(first.step.id, "banana")).resolves.toBe("Enter the expected port");
+    expect(session.getStatus()).toBe("running");
+    expect((await session.next()).step?.id).toBe(first.step.id);
+
+    await session.answer(first.step.id, "18789");
+    expect((await session.next()).status).toBe("done");
+  });
+
+  test("rejects non-scalar text answers before validation and resolution", async () => {
+    let resolved: string | undefined;
+    const session = new WizardSession(async (prompter) => {
+      resolved = await prompter.text({
+        message: "Token",
+        validate: (value) => (value.length > 0 ? undefined : "Token is required"),
+      });
+    });
+
+    const first = await session.next();
+    if (!first.step) {
+      throw new Error("expected text step");
+    }
+    await expect(session.answer(first.step.id, ["token"])).resolves.toBe(
+      "wizard: text answer must be a scalar value",
+    );
+    expect((await session.next()).step?.id).toBe(first.step.id);
+
+    await session.answer(first.step.id, "token");
+    expect((await session.next()).status).toBe("done");
+    expect(resolved).toBe("token");
   });
 
   test("cancel marks session and unblocks", async () => {
@@ -89,5 +150,28 @@ describe("WizardSession", () => {
     const done = await session.next();
     expect(done.done).toBe(true);
     expect(done.status).toBe("done");
+  });
+
+  test("forwards sensitive flag to the emitted text step", async () => {
+    const session = new WizardSession(async (prompter) => {
+      await prompter.text({ message: "API key", sensitive: true });
+      await prompter.text({ message: "Username" });
+    });
+
+    const sensitiveStep = (await session.next()).step;
+    expect(sensitiveStep?.type).toBe("text");
+    expect(sensitiveStep?.sensitive).toBe(true);
+    if (!sensitiveStep) {
+      throw new Error("expected sensitive step");
+    }
+    await session.answer(sensitiveStep.id, "fake-key-aa11");
+
+    const plainStep = (await session.next()).step;
+    expect(plainStep?.type).toBe("text");
+    expect(plainStep?.sensitive).toBeUndefined();
+    if (!plainStep) {
+      throw new Error("expected plain step");
+    }
+    await session.answer(plainStep.id, "alice");
   });
 });

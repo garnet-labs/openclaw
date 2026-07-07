@@ -1,5 +1,6 @@
+// Model auth runtime types describe provider auth state exposed to plugin runtimes.
 import type { ResolvedProviderAuth } from "../../agents/model-auth-runtime-shared.js";
-import type { ProviderRequestTransportOverrides } from "../../agents/provider-request-config.js";
+import type { ModelProviderRequestTransportOverrides } from "../../agents/provider-request-config.js";
 
 /**
  * Runtime-ready auth result exposed to native plugins and context engines.
@@ -11,6 +12,6 @@ import type { ProviderRequestTransportOverrides } from "../../agents/provider-re
 export type ResolvedProviderRuntimeAuth = Omit<ResolvedProviderAuth, "apiKey"> & {
   apiKey?: string;
   baseUrl?: string;
-  request?: ProviderRequestTransportOverrides;
+  request?: ModelProviderRequestTransportOverrides;
   expiresAt?: number;
 };

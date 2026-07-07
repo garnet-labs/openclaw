@@ -1,3 +1,5 @@
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+// Matrix plugin module implements verification events behavior.
 import type { MatrixClient } from "../sdk.js";
 import { resolveMatrixMonitorAccessState } from "./access-state.js";
 import type { MatrixRawEvent } from "./types.js";
@@ -30,23 +32,14 @@ type MatrixVerificationSummaryLike = {
   };
 };
 
-type MatrixDirectRoomDeps = {
-  inspectMatrixDirectRooms: typeof import("../direct-management.js").inspectMatrixDirectRooms;
-  isStrictDirectRoom: typeof import("../direct-room.js").isStrictDirectRoom;
-};
-
-let matrixDirectRoomDepsPromise: Promise<MatrixDirectRoomDeps> | undefined;
-
-async function loadMatrixDirectRoomDeps(): Promise<MatrixDirectRoomDeps> {
-  matrixDirectRoomDepsPromise ??= Promise.all([
-    import("../direct-management.js"),
-    import("../direct-room.js"),
-  ]).then(([directManagementModule, directRoomModule]) => ({
-    inspectMatrixDirectRooms: directManagementModule.inspectMatrixDirectRooms,
-    isStrictDirectRoom: directRoomModule.isStrictDirectRoom,
-  }));
-  return await matrixDirectRoomDepsPromise;
-}
+const loadMatrixDirectRoomDeps = createLazyRuntimeModule(() =>
+  Promise.all([import("../direct-management.js"), import("../direct-room.js")]).then(
+    ([directManagementModule, directRoomModule]) => ({
+      inspectMatrixDirectRooms: directManagementModule.inspectMatrixDirectRooms,
+      isStrictDirectRoom: directRoomModule.isStrictDirectRoom,
+    }),
+  ),
+);
 
 function trimMaybeString(input: unknown): string | null {
   if (typeof input !== "string") {
@@ -280,6 +273,7 @@ async function resolveVerificationSasNoticeForSignal(
     senderId: string;
     flowId: string | null;
     stage: MatrixVerificationStage;
+    sasNoticeRetryDelayMs?: number;
   },
 ): Promise<{ summary: MatrixVerificationSummaryLike | null; sasNotice: string | null }> {
   const summary = await resolveVerificationSummaryForSignal(client, params);
@@ -292,7 +286,9 @@ async function resolveVerificationSasNoticeForSignal(
     };
   }
 
-  await new Promise((resolve) => setTimeout(resolve, SAS_NOTICE_RETRY_DELAY_MS));
+  await new Promise((resolve) => {
+    setTimeout(resolve, params.sasNoticeRetryDelayMs ?? SAS_NOTICE_RETRY_DELAY_MS);
+  });
   const retriedSummary = await resolveVerificationSummaryForSignal(client, params);
   return {
     summary: retriedSummary,
@@ -355,21 +351,23 @@ async function isVerificationNoticeAuthorized(params: {
     );
     return false;
   }
-  if (params.dmPolicy === "open") {
-    return true;
-  }
-  const storeAllowFrom = await params.readStoreAllowFrom();
-  const accessState = resolveMatrixMonitorAccessState({
+  const storeAllowFrom =
+    params.dmPolicy !== "allowlist" && params.dmPolicy !== "open"
+      ? await params.readStoreAllowFrom()
+      : [];
+  const accessState = await resolveMatrixMonitorAccessState({
     allowFrom: params.allowFrom,
     storeAllowFrom,
+    dmPolicy: params.dmPolicy,
     // Verification flows only exist in strict DMs, so room/group allowlists do
     // not participate in the authorization decision here.
+    groupPolicy: "open",
     groupAllowFrom: [],
     roomUsers: [],
     senderId: params.senderId,
     isRoom: false,
   });
-  if (accessState.directAllowMatch.allowed) {
+  if (accessState.messageIngress.senderAccess.decision === "allow") {
     return true;
   }
   params.logVerboseMessage(
@@ -385,6 +383,8 @@ export function createMatrixVerificationEventRouter(params: {
   dmPolicy: "open" | "pairing" | "allowlist" | "disabled";
   readStoreAllowFrom: () => Promise<string[]>;
   logVerboseMessage: (message: string) => void;
+  sasNoticeRetryDelayMs?: number;
+  runDetachedTask?: (label: string, task: () => Promise<void>) => Promise<void>;
 }) {
   const routerStartedAtMs = Date.now();
   const routedVerificationEvents = new Set<string>();
@@ -539,7 +539,7 @@ export function createMatrixVerificationEventRouter(params: {
     }
     rememberVerificationRoom(roomId, event, signal.flowId);
 
-    void (async () => {
+    const routeTask = async () => {
       if (!shouldEmitVerificationEventNotice(event)) {
         params.logVerboseMessage(
           `matrix: ignoring historical verification event room=${roomId} id=${event.event_id ?? "unknown"} type=${event.type ?? "unknown"}`,
@@ -586,6 +586,7 @@ export function createMatrixVerificationEventRouter(params: {
         senderId,
         flowId,
         stage: signal.stage,
+        sasNoticeRetryDelayMs: params.sasNoticeRetryDelayMs,
       }).catch(() => ({ summary: null, sasNotice: null }));
 
       const notices: string[] = [];
@@ -613,9 +614,17 @@ export function createMatrixVerificationEventRouter(params: {
           logVerboseMessage: params.logVerboseMessage,
         });
       }
-    })().catch((err) => {
-      params.logVerboseMessage(`matrix: failed routing verification event: ${String(err)}`);
-    });
+    };
+    if (params.runDetachedTask) {
+      void params.runDetachedTask(
+        `verification event handler room=${roomId} id=${event.event_id ?? "unknown"}`,
+        routeTask,
+      );
+    } else {
+      void routeTask().catch((err: unknown) => {
+        params.logVerboseMessage(`matrix: failed routing verification event: ${String(err)}`);
+      });
+    }
 
     return true;
   }

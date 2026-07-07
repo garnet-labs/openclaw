@@ -16,26 +16,6 @@ path_is_docsish() {
   return 1
 }
 
-path_is_testish() {
-  local path="$1"
-  case "$path" in
-    *__tests__/*|*.test.*|*.spec.*|test/*|tests/*)
-      return 0
-      ;;
-  esac
-  return 1
-}
-
-path_is_maintainer_workflow_only() {
-  local path="$1"
-  case "$path" in
-    .agents/*|scripts/pr|scripts/pr-*|docs/subagent.md)
-      return 0
-      ;;
-  esac
-  return 1
-}
-
 file_list_is_docsish_only() {
   local files="$1"
   local saw_any=false
@@ -52,22 +32,17 @@ file_list_is_docsish_only() {
 }
 
 changelog_required_for_changed_files() {
-  local files="$1"
-  local saw_any=false
-  local path
-  while IFS= read -r path; do
-    [ -n "$path" ] || continue
-    saw_any=true
-    if path_is_docsish "$path" || path_is_testish "$path" || path_is_maintainer_workflow_only "$path"; then
-      continue
-    fi
-    return 0
-  done <<<"$files"
+  # CHANGELOG.md is release-owned. Normal PRs carry release-note context in
+  # PR bodies and commit messages; release automation generates the file.
+  return 1
+}
 
-  if [ "$saw_any" = "false" ]; then
-    return 1
-  fi
-
+root_changelog_update_allowed_for_pr() {
+  case "${OPENCLAW_ALLOW_ROOT_CHANGELOG_PR:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+  esac
   return 1
 }
 
@@ -170,25 +145,30 @@ wait_for_pr_head_sha() {
   return 1
 }
 
-is_author_email_merge_error() {
-  local msg="$1"
-  printf '%s\n' "$msg" | rg -qi 'author.?email|email.*associated|associated.*email|invalid.*email'
+pr_contributor_allows_human_trailers() {
+  local contrib="${1:-}"
+  local normalized
+  normalized=$(printf '%s' "$contrib" | tr '[:upper:]' '[:lower:]')
+
+  case "$normalized" in
+    ""|"null"|"app/"*|"codex"|"openclaw"|"clawsweeper"|"openclaw-clawsweeper"|"clawsweeper[bot]"|"openclaw-clawsweeper[bot]"|"steipete")
+      return 1
+      ;;
+  esac
+
+  return 0
 }
 
-merge_author_email_candidates() {
-  local reviewer="$1"
-  local reviewer_id="$2"
+resolve_contributor_coauthor_email() {
+  local contrib="${1:-}"
 
-  local gh_email
-  gh_email=$(gh api user --jq '.email // ""' 2>/dev/null || true)
-  local git_email
-  git_email=$(git config user.email 2>/dev/null || true)
+  if ! pr_contributor_allows_human_trailers "$contrib"; then
+    return 1
+  fi
 
-  printf '%s\n' \
-    "$gh_email" \
-    "$git_email" \
-    "${reviewer_id}+${reviewer}@users.noreply.github.com" \
-    "${reviewer}@users.noreply.github.com" | awk 'NF && !seen[$0]++'
+  local contrib_id
+  contrib_id=$(gh api "users/$contrib" --jq .id) || return 1
+  printf '%s+%s@users.noreply.github.com\n' "$contrib_id" "$contrib"
 }
 
 common_repo_root() {

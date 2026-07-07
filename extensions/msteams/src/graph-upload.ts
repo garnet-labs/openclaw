@@ -9,14 +9,16 @@
  * - Getting chat members for per-user sharing
  */
 
+import { readProviderJsonResponse } from "openclaw/plugin-sdk/provider-http";
 import type { MSTeamsAccessTokenProvider } from "./attachments/types.js";
+import { createMSTeamsHttpError } from "./http-error.js";
 import { buildUserAgent } from "./user-agent.js";
 
 const GRAPH_ROOT = "https://graph.microsoft.com/v1.0";
 const GRAPH_BETA = "https://graph.microsoft.com/beta";
 const GRAPH_SCOPE = "https://graph.microsoft.com";
 
-export interface OneDriveUploadResult {
+interface OneDriveUploadResult {
   id: string;
   webUrl: string;
   name: string;
@@ -50,15 +52,14 @@ export async function uploadToOneDrive(params: {
   });
 
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`OneDrive upload failed: ${res.status} ${res.statusText} - ${body}`);
+    throw await createMSTeamsHttpError(res, "OneDrive upload failed");
   }
 
-  const data = (await res.json()) as {
+  const data = await readProviderJsonResponse<{
     id?: string;
     webUrl?: string;
     name?: string;
-  };
+  }>(res, "msteams.graph-upload.uploadOneDriveFile");
 
   if (!data.id || !data.webUrl || !data.name) {
     throw new Error("OneDrive upload response missing required fields");
@@ -71,7 +72,7 @@ export async function uploadToOneDrive(params: {
   };
 }
 
-export interface OneDriveSharingLink {
+interface OneDriveSharingLink {
   webUrl: string;
 }
 
@@ -79,7 +80,7 @@ export interface OneDriveSharingLink {
  * Create a sharing link for a OneDrive file.
  * The link allows organization members to view the file.
  */
-export async function createSharingLink(params: {
+async function createSharingLink(params: {
   itemId: string;
   tokenProvider: MSTeamsAccessTokenProvider;
   /** Sharing scope: "organization" (default) or "anonymous" */
@@ -103,13 +104,12 @@ export async function createSharingLink(params: {
   });
 
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Create sharing link failed: ${res.status} ${res.statusText} - ${body}`);
+    throw await createMSTeamsHttpError(res, "Create sharing link failed");
   }
 
-  const data = (await res.json()) as {
+  const data = await readProviderJsonResponse<{
     link?: { webUrl?: string };
-  };
+  }>(res, "msteams.graph-upload.createOneDriveSharingLink");
 
   if (!data.link?.webUrl) {
     throw new Error("Create sharing link response missing webUrl");
@@ -198,15 +198,14 @@ export async function uploadToSharePoint(params: {
   );
 
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`SharePoint upload failed: ${res.status} ${res.statusText} - ${body}`);
+    throw await createMSTeamsHttpError(res, "SharePoint upload failed");
   }
 
-  const data = (await res.json()) as {
+  const data = await readProviderJsonResponse<{
     id?: string;
     webUrl?: string;
     name?: string;
-  };
+  }>(res, "msteams.graph-upload.uploadSharePointFile");
 
   if (!data.id || !data.webUrl || !data.name) {
     throw new Error("SharePoint upload response missing required fields");
@@ -219,7 +218,7 @@ export async function uploadToSharePoint(params: {
   };
 }
 
-export interface ChatMember {
+interface ChatMember {
   aadObjectId: string;
   displayName?: string;
 }
@@ -259,15 +258,14 @@ export async function getDriveItemProperties(params: {
   );
 
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Get driveItem properties failed: ${res.status} ${res.statusText} - ${body}`);
+    throw await createMSTeamsHttpError(res, "Get driveItem properties failed");
   }
 
-  const data = (await res.json()) as {
+  const data = await readProviderJsonResponse<{
     eTag?: string;
     webDavUrl?: string;
     name?: string;
-  };
+  }>(res, "msteams.graph-upload.getDriveItemProperties");
 
   if (!data.eTag || !data.webDavUrl || !data.name) {
     throw new Error("DriveItem response missing required properties (eTag, webDavUrl, or name)");
@@ -334,9 +332,9 @@ export async function resolveGraphChatId(params: {
     return null;
   }
 
-  const data = (await res.json()) as {
+  const data = await readProviderJsonResponse<{
     value?: Array<{ id?: string }>;
-  };
+  }>(res, "msteams.graph-upload.getOneOnOneChatId");
 
   const chats = data.value ?? [];
 
@@ -358,7 +356,7 @@ export async function resolveGraphChatId(params: {
  * Get members of a Teams chat for per-user sharing.
  * Used to create sharing links scoped to only the chat participants.
  */
-export async function getChatMembers(params: {
+async function getChatMembers(params: {
   chatId: string;
   tokenProvider: MSTeamsAccessTokenProvider;
   fetchFn?: typeof fetch;
@@ -371,16 +369,15 @@ export async function getChatMembers(params: {
   });
 
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Get chat members failed: ${res.status} ${res.statusText} - ${body}`);
+    throw await createMSTeamsHttpError(res, "Get chat members failed");
   }
 
-  const data = (await res.json()) as {
+  const data = await readProviderJsonResponse<{
     value?: Array<{
       userId?: string;
       displayName?: string;
     }>;
-  };
+  }>(res, "msteams.graph-upload.getChatMembers");
 
   return (data.value ?? [])
     .map((m) => ({
@@ -395,7 +392,7 @@ export async function getChatMembers(params: {
  * For organization scope (default), uses v1.0 API.
  * For per-user scope, uses beta API with recipients.
  */
-export async function createSharePointSharingLink(params: {
+async function createSharePointSharingLink(params: {
   siteId: string;
   itemId: string;
   tokenProvider: MSTeamsAccessTokenProvider;
@@ -436,15 +433,12 @@ export async function createSharePointSharingLink(params: {
   );
 
   if (!res.ok) {
-    const respBody = await res.text().catch(() => "");
-    throw new Error(
-      `Create SharePoint sharing link failed: ${res.status} ${res.statusText} - ${respBody}`,
-    );
+    throw await createMSTeamsHttpError(res, "Create SharePoint sharing link failed");
   }
 
-  const data = (await res.json()) as {
+  const data = await readProviderJsonResponse<{
     link?: { webUrl?: string };
-  };
+  }>(res, "msteams.graph-upload.createSharePointSharingLink");
 
   if (!data.link?.webUrl) {
     throw new Error("Create SharePoint sharing link response missing webUrl");
