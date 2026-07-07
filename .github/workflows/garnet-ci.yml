@@ -19,7 +19,7 @@ jobs:
       - name: Garnet Runtime Review
         uses: garnet-org/action@v2
         with:
-          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          api_token: ${{ secrets.GARNET_API_TOKEN_DEV }}
           api_url: https://dev-api.garnet.ai
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
