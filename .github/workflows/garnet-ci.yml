@@ -15,14 +15,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
       - name: Garnet Runtime Review
-        uses: garnet-org/action@v2
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN_DEV }}
           api_url: https://dev-api.garnet.ai
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - name: Enable corepack (pnpm from packageManager)
+        run: corepack enable
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: 22
           cache: pnpm
