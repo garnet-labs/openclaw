@@ -1,5 +1,19 @@
-import { describe, expect, it } from "vitest";
+// Covers channel/target inference, legacy target rewrite, target validation,
+// and plugin alias-aware message-action normalization.
+import { describe, expect, it, vi } from "vitest";
 import { normalizeMessageActionInput } from "./message-action-normalization.js";
+
+vi.mock("../../channels/plugins/bootstrap-registry.js", async () => ({
+  getBootstrapChannelPlugin: (
+    await import("./message-action-test-fixtures.js")
+  ).createPinboardMessageActionBootstrapRegistryMock(),
+}));
+
+vi.mock("../../utils/message-channel.js", () => ({
+  isDeliverableMessageChannel: (value: string) => ["workspace", "forum"].includes(value),
+  normalizeMessageChannel: (value?: string | null) =>
+    typeof value === "string" ? value.trim().toLowerCase() : undefined,
+}));
 
 describe("normalizeMessageActionInput", () => {
   type NormalizeMessageActionInputCase = {
@@ -55,15 +69,37 @@ describe("normalizeMessageActionInput", () => {
     {
       input: {
         action: "send",
+        args: {},
+        toolContext: {
+          currentChannelId: "user:U1",
+          currentChannelProvider: "slack",
+        },
+      },
+      expectedFields: { target: "user:U1", to: "user:U1" },
+    },
+    {
+      input: {
+        action: "send",
+        args: {},
+        toolContext: {
+          currentMessagingTarget: "user:U1",
+          currentChannelProvider: "slack",
+        },
+      },
+      expectedFields: { target: "user:U1", to: "user:U1" },
+    },
+    {
+      input: {
+        action: "send",
         args: {
           target: "channel:C1",
         },
         toolContext: {
           currentChannelId: "C1",
-          currentChannelProvider: "slack",
+          currentChannelProvider: "workspace",
         },
       },
-      expectedFields: { channel: "slack" },
+      expectedFields: { channel: "workspace" },
     },
     {
       input: {
@@ -104,7 +140,7 @@ describe("normalizeMessageActionInput", () => {
       input: {
         action: "pin",
         args: {
-          channel: "feishu",
+          channel: "pinboard",
           messageId: "om_123",
         },
       },
@@ -115,7 +151,7 @@ describe("normalizeMessageActionInput", () => {
       input: {
         action: "list-pins",
         args: {
-          channel: "feishu",
+          channel: "pinboard",
           chatId: "oc_123",
         },
       },
@@ -124,14 +160,38 @@ describe("normalizeMessageActionInput", () => {
     },
     {
       input: {
+        action: "poll",
+        args: {
+          channel: "imessage",
+          chatGuid: "iMessage;+;chat0000",
+        },
+      },
+      expectedFields: {
+        target: "chat_guid:iMessage;+;chat0000",
+        to: "chat_guid:iMessage;+;chat0000",
+        chatGuid: "iMessage;+;chat0000",
+      },
+    },
+    {
+      input: {
+        action: "poll-vote",
+        args: {
+          channel: "imessage",
+          chatId: 42,
+        },
+      },
+      expectedFields: { target: "chat_id:42", to: "chat_id:42", chatId: 42 },
+    },
+    {
+      input: {
         action: "read",
         args: {
-          channel: "slack",
+          channel: "workspace",
           messageId: "123.456",
         },
         toolContext: {
           currentChannelId: "C12345678",
-          currentChannelProvider: "slack",
+          currentChannelProvider: "workspace",
         },
       },
       expectedFields: { target: "C12345678", messageId: "123.456" },
@@ -168,5 +228,18 @@ describe("normalizeMessageActionInput", () => {
         args: {},
       }),
     ).toThrow(/requires a target/);
+  });
+
+  it("rejects conflicting canonical and plugin delivery targets", () => {
+    expect(() =>
+      normalizeMessageActionInput({
+        action: "poll-vote",
+        args: {
+          channel: "imessage",
+          target: "chat_guid:iMessage;-;+15550001111",
+          chatGuid: "iMessage;-;+15559998888",
+        },
+      }),
+    ).toThrow(/conflicting target and delivery alias/);
   });
 });

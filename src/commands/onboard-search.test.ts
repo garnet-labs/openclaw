@@ -1,3 +1,4 @@
+// Onboard search tests cover provider options, credential handling, and search setup config mutation.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import type { PluginWebSearchProviderEntry } from "../plugins/types.js";
@@ -27,6 +28,17 @@ const SEARCH_PROVIDER_PLUGINS: Record<
     envVars: ["KIMI_API_KEY", "MOONSHOT_API_KEY"],
     label: "Kimi",
     credentialLabel: "Moonshot / Kimi API key",
+  },
+  minimax: {
+    pluginId: "minimax",
+    envVars: [
+      "MINIMAX_CODE_PLAN_KEY",
+      "MINIMAX_CODING_API_KEY",
+      "MINIMAX_OAUTH_TOKEN",
+      "MINIMAX_API_KEY",
+    ],
+    label: "MiniMax Search",
+    credentialLabel: "MiniMax Token Plan key or OAuth token",
   },
   perplexity: {
     pluginId: "perplexity",
@@ -84,28 +96,36 @@ function createSearchProviderEntry(id: string): PluginWebSearchProviderEntry {
       >;
       entries[metadata.pluginId] = { ...entries[metadata.pluginId], enabled: true };
       next.plugins = { ...next.plugins, entries };
-      return next;
+      if (id !== "firecrawl" || next.tools?.web?.fetch?.provider) {
+        return next;
+      }
+      return {
+        ...next,
+        tools: {
+          ...next.tools,
+          web: {
+            ...next.tools?.web,
+            fetch: { provider: "firecrawl" },
+          },
+        },
+      };
     },
   };
   if (id === "kimi") {
     entry.runSetup = async ({ config, prompter }) => {
-      const baseUrl = String(
-        await prompter.select({
-          message: "Moonshot endpoint",
-          options: [{ value: "https://api.moonshot.ai/v1", label: "Moonshot" }],
-          initialValue: "https://api.moonshot.ai/v1",
-        }),
-      );
-      const modelChoice = String(
-        await prompter.select({
-          message: "Moonshot web-search model",
-          options: [{ value: "__keep__", label: "Keep default" }],
-          initialValue: "__keep__",
-        }),
-      );
+      const baseUrl = await prompter.select({
+        message: "Moonshot endpoint",
+        options: [{ value: "https://api.moonshot.ai/v1", label: "Moonshot" }],
+        initialValue: "https://api.moonshot.ai/v1",
+      });
+      const modelChoice = await prompter.select({
+        message: "Moonshot web-search model",
+        options: [{ value: "__keep__", label: "Keep default" }],
+        initialValue: "__keep__",
+      });
       const webSearch = ensureWebSearchConfig(config, metadata.pluginId);
       webSearch.baseUrl = baseUrl;
-      webSearch.model = modelChoice === "__keep__" ? "kimi-k2.5" : modelChoice;
+      webSearch.model = modelChoice === "__keep__" ? "kimi-k2.6" : modelChoice;
       return config;
     };
   }
@@ -114,7 +134,7 @@ function createSearchProviderEntry(id: string): PluginWebSearchProviderEntry {
 
 const searchProviderFixture = vi.hoisted(() => ({
   resolvePluginWebSearchProviders: vi.fn(() =>
-    ["brave", "firecrawl", "gemini", "grok", "kimi", "perplexity", "tavily"].map((id) =>
+    ["brave", "firecrawl", "gemini", "grok", "kimi", "minimax", "perplexity", "tavily"].map((id) =>
       createSearchProviderEntry(id),
     ),
   ),
@@ -139,6 +159,10 @@ const SEARCH_PROVIDER_ENV_VARS = [
   "GOOGLE_API_KEY",
   "KIMI_API_KEY",
   "MOONSHOT_API_KEY",
+  "MINIMAX_API_KEY",
+  "MINIMAX_CODE_PLAN_KEY",
+  "MINIMAX_CODING_API_KEY",
+  "MINIMAX_OAUTH_TOKEN",
   "OPENROUTER_API_KEY",
   "PERPLEXITY_API_KEY",
   "TAVILY_API_KEY",
@@ -173,6 +197,10 @@ function createPrompter(params: {
     progress: vi.fn(() => ({ update: vi.fn(), stop: vi.fn() })),
   };
   return { prompter, notes };
+}
+
+function mockCalls<T extends unknown[]>(fn: unknown): T[] {
+  return (fn as { mock: { calls: T[] } }).mock.calls;
 }
 
 function createPerplexityConfig(apiKey: string, enabled?: boolean): OpenClawConfig {
@@ -299,121 +327,69 @@ describe("setupSearch", () => {
     expect(result).toBe(cfg);
   });
 
-  it("sets provider and key for perplexity", async () => {
-    const cfg: OpenClawConfig = {};
-    const { prompter } = createPrompter({
-      selectValue: "perplexity",
-      textValue: "pplx-test-key",
-    });
-    const result = await setupSearch(cfg, runtime, prompter);
-    expect(result.tools?.web?.search?.provider).toBe("perplexity");
-    expect(pluginWebSearchApiKey(result, "perplexity")).toBe("pplx-test-key");
-    expect(result.tools?.web?.search?.enabled).toBe(true);
-    expect(result.plugins?.entries?.perplexity?.enabled).toBe(true);
-  });
+  it("sets provider keys and enables plugin entries", async () => {
+    const cases = [
+      { provider: "perplexity", pluginId: "perplexity", key: "pplx-test-key" },
+      { provider: "brave", pluginId: "brave", key: "BSA-test-key" },
+      { provider: "firecrawl", pluginId: "firecrawl", key: "fc-test-key" },
+      { provider: "grok", pluginId: "xai", key: "xai-test" },
+      { provider: "tavily", pluginId: "tavily", key: "tvly-test-key" },
+      {
+        provider: "gemini",
+        pluginId: "google",
+        key: "AIza-test",
+        textMessage: "Google Gemini API key",
+      },
+    ];
 
-  it("sets provider and key for brave", async () => {
-    const cfg: OpenClawConfig = {};
-    const { prompter } = createPrompter({
-      selectValue: "brave",
-      textValue: "BSA-test-key",
-    });
-    const result = await setupSearch(cfg, runtime, prompter);
-    expect(result.tools?.web?.search?.provider).toBe("brave");
-    expect(result.tools?.web?.search?.enabled).toBe(true);
-    expect(pluginWebSearchApiKey(result, "brave")).toBe("BSA-test-key");
-    expect(result.plugins?.entries?.brave?.enabled).toBe(true);
-  });
+    for (const entry of cases) {
+      const cfg: OpenClawConfig = {};
+      const { prompter } = createPrompter({
+        selectValue: entry.provider,
+        textValue: entry.key,
+      });
+      const result = await setupSearch(cfg, runtime, prompter);
+      expect(result.tools?.web?.search?.provider).toBe(entry.provider);
+      expect(result.tools?.web?.search?.enabled).toBe(true);
+      expect(pluginWebSearchApiKey(result, entry.pluginId)).toBe(entry.key);
+      expect(result.plugins?.entries?.[entry.pluginId]?.enabled).toBe(true);
+      if (entry.textMessage) {
+        const textCall = mockCalls<[Record<string, unknown>]>(prompter.text).find(
+          ([options]) => options.message === entry.textMessage,
+        );
+        expect(textCall?.[0].sensitive).toBe(true);
+      }
+    }
 
-  it("sets provider and key for gemini", async () => {
-    const cfg: OpenClawConfig = {};
-    const { prompter } = createPrompter({
-      selectValue: "gemini",
-      textValue: "AIza-test",
-    });
-    const result = await setupSearch(cfg, runtime, prompter);
-    expect(result.tools?.web?.search?.provider).toBe("gemini");
-    expect(result.tools?.web?.search?.enabled).toBe(true);
-    expect(pluginWebSearchApiKey(result, "google")).toBe("AIza-test");
-    expect(result.plugins?.entries?.google?.enabled).toBe(true);
-    expect(prompter.text).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: "Google Gemini API key",
-      }),
-    );
-  });
-
-  it("sets provider and key for firecrawl and enables the plugin", async () => {
-    const cfg: OpenClawConfig = {};
-    const { prompter } = createPrompter({
-      selectValue: "firecrawl",
-      textValue: "fc-test-key",
-    });
-    const result = await setupSearch(cfg, runtime, prompter);
-    expect(result.tools?.web?.search?.provider).toBe("firecrawl");
-    expect(result.tools?.web?.search?.enabled).toBe(true);
-    expect(pluginWebSearchApiKey(result, "firecrawl")).toBe("fc-test-key");
-    expect(result.plugins?.entries?.firecrawl?.enabled).toBe(true);
-  });
-
-  it("re-enables firecrawl and persists its plugin config when selected from disabled state", async () => {
-    const cfg = createDisabledFirecrawlConfig();
-    const { prompter } = createPrompter({
-      selectValue: "firecrawl",
-      textValue: "fc-disabled-key",
-    });
-    const result = await setupSearch(cfg, runtime, prompter);
-    expect(result.tools?.web?.search?.provider).toBe("firecrawl");
-    expect(result.tools?.web?.search?.enabled).toBe(true);
-    expect(result.plugins?.entries?.firecrawl?.enabled).toBe(true);
-    expect(readFirecrawlPluginApiKey(result)).toBe("fc-disabled-key");
-  });
-
-  it("sets provider and key for grok", async () => {
-    const cfg: OpenClawConfig = {};
-    const { prompter } = createPrompter({
-      selectValue: "grok",
-      textValue: "xai-test",
-    });
-    const result = await setupSearch(cfg, runtime, prompter);
-    expect(result.tools?.web?.search?.provider).toBe("grok");
-    expect(result.tools?.web?.search?.enabled).toBe(true);
-    expect(pluginWebSearchApiKey(result, "xai")).toBe("xai-test");
-    expect(result.plugins?.entries?.xai?.enabled).toBe(true);
-  });
-
-  it("sets provider and key for kimi", async () => {
-    const cfg: OpenClawConfig = {};
-    const { prompter } = createPrompter({
+    const kimiCfg: OpenClawConfig = {};
+    const { prompter: kimiPrompter } = createPrompter({
       selectValues: ["kimi", "https://api.moonshot.ai/v1", "__keep__"],
       textValue: "sk-moonshot",
     });
-    const result = await setupSearch(cfg, runtime, prompter);
-    const kimiWebSearchConfig = result.plugins?.entries?.moonshot?.config?.webSearch as
+    const kimiResult = await setupSearch(kimiCfg, runtime, kimiPrompter);
+    const kimiWebSearchConfig = kimiResult.plugins?.entries?.moonshot?.config?.webSearch as
       | {
           baseUrl?: string;
           model?: string;
         }
       | undefined;
-    expect(result.tools?.web?.search?.provider).toBe("kimi");
-    expect(result.tools?.web?.search?.enabled).toBe(true);
-    expect(pluginWebSearchApiKey(result, "moonshot")).toBe("sk-moonshot");
-    expect(result.plugins?.entries?.moonshot?.enabled).toBe(true);
+    expect(kimiResult.tools?.web?.search?.provider).toBe("kimi");
+    expect(kimiResult.tools?.web?.search?.enabled).toBe(true);
+    expect(pluginWebSearchApiKey(kimiResult, "moonshot")).toBe("sk-moonshot");
+    expect(kimiResult.plugins?.entries?.moonshot?.enabled).toBe(true);
     expect(kimiWebSearchConfig?.baseUrl).toBe("https://api.moonshot.ai/v1");
-    expect(kimiWebSearchConfig?.model).toBe("kimi-k2.5");
-  });
+    expect(kimiWebSearchConfig?.model).toBe("kimi-k2.6");
 
-  it("sets provider and key for tavily and enables the plugin", async () => {
-    const cfg: OpenClawConfig = {};
-    const { prompter } = createPrompter({
-      selectValue: "tavily",
-      textValue: "tvly-test-key",
+    const disabledCfg = createDisabledFirecrawlConfig();
+    const { prompter: disabledPrompter } = createPrompter({
+      selectValue: "firecrawl",
+      textValue: "fc-disabled-key",
     });
-    const result = await setupSearch(cfg, runtime, prompter);
-    expect(result.tools?.web?.search?.provider).toBe("tavily");
-    expect(result.tools?.web?.search?.enabled).toBe(true);
-    expect(pluginWebSearchApiKey(result, "tavily")).toBe("tvly-test-key");
-    expect(result.plugins?.entries?.tavily?.enabled).toBe(true);
+    const disabledResult = await setupSearch(disabledCfg, runtime, disabledPrompter);
+    expect(disabledResult.tools?.web?.search?.provider).toBe("firecrawl");
+    expect(disabledResult.tools?.web?.search?.enabled).toBe(true);
+    expect(disabledResult.plugins?.entries?.firecrawl?.enabled).toBe(true);
+    expect(readFirecrawlPluginApiKey(disabledResult)).toBe("fc-disabled-key");
   });
 
   it("shows missing-key note when no key is provided and no env var", async () => {
@@ -427,14 +403,38 @@ describe("setupSearch", () => {
       });
       const result = await setupSearch(cfg, runtime, prompter);
       expect(result.tools?.web?.search?.provider).toBe("brave");
-      expect(result.tools?.web?.search?.enabled).toBeUndefined();
+      expect(result.tools?.web?.search?.enabled).toBe(false);
       const missingNote = notes.find((n) => n.message.includes("No Brave Search API key stored"));
-      expect(missingNote).toBeDefined();
+      expect(missingNote?.message).toContain("No Brave Search API key stored");
     } finally {
       if (original === undefined) {
         delete process.env.BRAVE_API_KEY;
       } else {
         process.env.BRAVE_API_KEY = original;
+      }
+    }
+  });
+
+  it("keeps keyless Firecrawl fetch configured when search setup has no key", async () => {
+    const original = process.env.FIRECRAWL_API_KEY;
+    delete process.env.FIRECRAWL_API_KEY;
+    try {
+      const { prompter } = createPrompter({
+        selectValue: "firecrawl",
+        textValue: "",
+      });
+
+      const result = await setupSearch({}, runtime, prompter);
+
+      expect(result.tools?.web?.search?.provider).toBe("firecrawl");
+      expect(result.tools?.web?.search?.enabled).toBe(false);
+      expect(result.tools?.web?.fetch?.provider).toBe("firecrawl");
+      expect(result.plugins?.entries?.firecrawl?.enabled).toBe(true);
+    } finally {
+      if (original === undefined) {
+        delete process.env.FIRECRAWL_API_KEY;
+      } else {
+        process.env.FIRECRAWL_API_KEY = original;
       }
     }
   });
@@ -445,15 +445,13 @@ describe("setupSearch", () => {
     );
     expect(pluginWebSearchApiKey(result, "perplexity")).toBe("existing-key");
     expect(result.tools?.web?.search?.enabled).toBe(true);
-  });
 
-  it("advanced preserves enabled:false when keeping existing key", async () => {
-    const result = await runBlankPerplexityKeyEntry(
+    const disabledResult = await runBlankPerplexityKeyEntry(
       "existing-key", // pragma: allowlist secret
       false,
     );
-    expect(pluginWebSearchApiKey(result, "perplexity")).toBe("existing-key");
-    expect(result.tools?.web?.search?.enabled).toBe(false);
+    expect(pluginWebSearchApiKey(disabledResult, "perplexity")).toBe("existing-key");
+    expect(disabledResult.tools?.web?.search?.enabled).toBe(false);
   });
 
   it("quickstart skips key prompt when config key exists", async () => {
@@ -464,17 +462,16 @@ describe("setupSearch", () => {
     expect(pluginWebSearchApiKey(result, "perplexity")).toBe("stored-pplx-key");
     expect(result.tools?.web?.search?.enabled).toBe(true);
     expect(prompter.text).not.toHaveBeenCalled();
-  });
 
-  it("quickstart preserves enabled:false when search was intentionally disabled", async () => {
-    const { result, prompter } = await runQuickstartPerplexitySetup(
-      "stored-pplx-key", // pragma: allowlist secret
-      false,
-    );
-    expect(result.tools?.web?.search?.provider).toBe("perplexity");
-    expect(pluginWebSearchApiKey(result, "perplexity")).toBe("stored-pplx-key");
-    expect(result.tools?.web?.search?.enabled).toBe(false);
-    expect(prompter.text).not.toHaveBeenCalled();
+    const { result: disabledResult, prompter: disabledPrompter } =
+      await runQuickstartPerplexitySetup(
+        "stored-pplx-key", // pragma: allowlist secret
+        false,
+      );
+    expect(disabledResult.tools?.web?.search?.provider).toBe("perplexity");
+    expect(pluginWebSearchApiKey(disabledResult, "perplexity")).toBe("stored-pplx-key");
+    expect(disabledResult.tools?.web?.search?.enabled).toBe(false);
+    expect(disabledPrompter.text).not.toHaveBeenCalled();
   });
 
   it("quickstart skips key prompt when canonical plugin config key exists", async () => {
@@ -520,7 +517,7 @@ describe("setupSearch", () => {
       });
       expect(prompter.text).toHaveBeenCalled();
       expect(result.tools?.web?.search?.provider).toBe("grok");
-      expect(result.tools?.web?.search?.enabled).toBeUndefined();
+      expect(result.tools?.web?.search?.enabled).toBe(false);
     } finally {
       if (original === undefined) {
         delete process.env.XAI_API_KEY;
@@ -537,11 +534,10 @@ describe("setupSearch", () => {
       textValue: "",
     });
     await setupSearch(cfg, runtime, prompter);
-    expect(prompter.text).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: "Moonshot / Kimi API key",
-      }),
+    const textCall = mockCalls<[Record<string, unknown>]>(prompter.text).find(
+      ([options]) => options.message === "Moonshot / Kimi API key",
     );
+    expect(textCall?.[0].message).toBe("Moonshot / Kimi API key");
   });
 
   it("quickstart skips key prompt when env var is available", async () => {
@@ -618,15 +614,14 @@ describe("setupSearch", () => {
     }
   });
 
-  it("stores env-backed SecretRef when secretInputMode=ref for perplexity", async () => {
+  it("stores env-backed SecretRef for perplexity ref mode", async () => {
     const originalPerplexity = process.env.PERPLEXITY_API_KEY;
     const originalOpenRouter = process.env.OPENROUTER_API_KEY;
     delete process.env.PERPLEXITY_API_KEY;
     delete process.env.OPENROUTER_API_KEY;
-    const cfg: OpenClawConfig = {};
     try {
       const { prompter } = createPrompter({ selectValue: "perplexity" });
-      const result = await setupSearch(cfg, runtime, prompter, {
+      const result = await setupSearch({}, runtime, prompter, {
         secretInputMode: "ref", // pragma: allowlist secret
       });
       expect(result.tools?.web?.search?.provider).toBe("perplexity");
@@ -636,37 +631,18 @@ describe("setupSearch", () => {
         id: "PERPLEXITY_API_KEY", // pragma: allowlist secret
       });
       expect(prompter.text).not.toHaveBeenCalled();
-    } finally {
-      if (originalPerplexity === undefined) {
-        delete process.env.PERPLEXITY_API_KEY;
-      } else {
-        process.env.PERPLEXITY_API_KEY = originalPerplexity;
-      }
-      if (originalOpenRouter === undefined) {
-        delete process.env.OPENROUTER_API_KEY;
-      } else {
-        process.env.OPENROUTER_API_KEY = originalOpenRouter;
-      }
-    }
-  });
 
-  it("prefers detected OPENROUTER_API_KEY SecretRef for perplexity ref mode", async () => {
-    const originalPerplexity = process.env.PERPLEXITY_API_KEY;
-    const originalOpenRouter = process.env.OPENROUTER_API_KEY;
-    delete process.env.PERPLEXITY_API_KEY;
-    process.env.OPENROUTER_API_KEY = "sk-or-test";
-    const cfg: OpenClawConfig = {};
-    try {
-      const { prompter } = createPrompter({ selectValue: "perplexity" });
-      const result = await setupSearch(cfg, runtime, prompter, {
+      process.env.OPENROUTER_API_KEY = "sk-or-test";
+      const { prompter: openRouterPrompter } = createPrompter({ selectValue: "perplexity" });
+      const openRouterResult = await setupSearch({}, runtime, openRouterPrompter, {
         secretInputMode: "ref", // pragma: allowlist secret
       });
-      expect(pluginWebSearchApiKey(result, "perplexity")).toEqual({
+      expect(pluginWebSearchApiKey(openRouterResult, "perplexity")).toEqual({
         source: "env",
         provider: "default",
         id: "OPENROUTER_API_KEY", // pragma: allowlist secret
       });
-      expect(prompter.text).not.toHaveBeenCalled();
+      expect(openRouterPrompter.text).not.toHaveBeenCalled();
     } finally {
       if (originalPerplexity === undefined) {
         delete process.env.PERPLEXITY_API_KEY;
@@ -681,39 +657,27 @@ describe("setupSearch", () => {
     }
   });
 
-  it("stores env-backed SecretRef when secretInputMode=ref for brave", async () => {
-    const cfg: OpenClawConfig = {};
-    const { prompter } = createPrompter({ selectValue: "brave" });
-    const result = await setupSearch(cfg, runtime, prompter, {
-      secretInputMode: "ref", // pragma: allowlist secret
-    });
-    expect(result.tools?.web?.search?.provider).toBe("brave");
-    expect(pluginWebSearchApiKey(result, "brave")).toEqual({
-      source: "env",
-      provider: "default",
-      id: "BRAVE_API_KEY",
-    });
-    expect(result.plugins?.entries?.brave?.enabled).toBe(true);
-    expect(prompter.text).not.toHaveBeenCalled();
-  });
-
-  it("stores env-backed SecretRef when secretInputMode=ref for tavily", async () => {
+  it("stores env-backed SecretRefs for simple providers", async () => {
     const original = process.env.TAVILY_API_KEY;
     delete process.env.TAVILY_API_KEY;
-    const cfg: OpenClawConfig = {};
     try {
-      const { prompter } = createPrompter({ selectValue: "tavily" });
-      const result = await setupSearch(cfg, runtime, prompter, {
-        secretInputMode: "ref", // pragma: allowlist secret
-      });
-      expect(result.tools?.web?.search?.provider).toBe("tavily");
-      expect(pluginWebSearchApiKey(result, "tavily")).toEqual({
-        source: "env",
-        provider: "default",
-        id: "TAVILY_API_KEY",
-      });
-      expect(result.plugins?.entries?.tavily?.enabled).toBe(true);
-      expect(prompter.text).not.toHaveBeenCalled();
+      for (const entry of [
+        { provider: "brave", pluginId: "brave", env: "BRAVE_API_KEY" },
+        { provider: "tavily", pluginId: "tavily", env: "TAVILY_API_KEY" },
+      ]) {
+        const { prompter } = createPrompter({ selectValue: entry.provider });
+        const result = await setupSearch({}, runtime, prompter, {
+          secretInputMode: "ref", // pragma: allowlist secret
+        });
+        expect(result.tools?.web?.search?.provider).toBe(entry.provider);
+        expect(pluginWebSearchApiKey(result, entry.pluginId)).toEqual({
+          source: "env",
+          provider: "default",
+          id: entry.env,
+        });
+        expect(result.plugins?.entries?.[entry.pluginId]?.enabled).toBe(true);
+        expect(prompter.text).not.toHaveBeenCalled();
+      }
     } finally {
       if (original === undefined) {
         delete process.env.TAVILY_API_KEY;
@@ -737,16 +701,17 @@ describe("setupSearch", () => {
     const providers = listSearchProviderOptions();
     const values = providers.map((e) => e.id);
     expect(values).toEqual([...values].toSorted());
-    expect(values).toEqual(
-      expect.arrayContaining([
-        "brave",
-        "firecrawl",
-        "gemini",
-        "grok",
-        "kimi",
-        "perplexity",
-        "tavily",
-      ]),
-    );
+    for (const providerId of [
+      "brave",
+      "firecrawl",
+      "gemini",
+      "grok",
+      "kimi",
+      "minimax",
+      "perplexity",
+      "tavily",
+    ]) {
+      expect(values).toContain(providerId);
+    }
   });
 });

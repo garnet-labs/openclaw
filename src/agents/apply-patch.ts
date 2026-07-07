@@ -1,17 +1,19 @@
+/**
+ * Runtime apply_patch tool and parser.
+ * Parses OpenAI-style patch envelopes and applies add/update/delete/move hunks
+ * through guarded host or sandbox filesystem operations.
+ */
 import syncFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { AgentTool } from "@mariozechner/pi-agent-core";
-import { Type } from "@sinclair/typebox";
-import { openBoundaryFile, type BoundaryFileOpenResult } from "../infra/boundary-file-read.js";
-import {
-  mkdirPathWithinRoot,
-  removePathWithinRoot,
-  writeFileWithinRoot,
-} from "../infra/fs-safe.js";
+import { Type } from "typebox";
+import { createAbortError } from "../infra/abort-signal.js";
+import { openRootFile, type RootFileOpenResult } from "../infra/boundary-file-read.js";
+import { root as fsRoot } from "../infra/fs-safe.js";
 import { PATH_ALIAS_POLICIES, type PathAliasPolicy } from "../infra/path-alias-guards.js";
 import { applyUpdateHunk } from "./apply-patch-update.js";
 import { toRelativeSandboxPath, resolvePathFromInput } from "./path-policy.js";
+import type { AgentTool } from "./runtime/index.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
 import type { SandboxFsBridge } from "./sandbox/fs-bridge.js";
 
@@ -58,14 +60,23 @@ export type ApplyPatchSummary = {
   deleted: string[];
 };
 
-export type ApplyPatchResult = {
+type ApplyPatchResult = {
   summary: ApplyPatchSummary;
   text: string;
+  noOp?: boolean;
 };
 
-export type ApplyPatchToolDetails = {
+type ApplyPatchToolDetails = {
   summary: ApplyPatchSummary;
 };
+
+function normalizeUpdateComparison(content: string): string {
+  const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (normalized.length === 0 || normalized.endsWith("\n")) {
+    return normalized;
+  }
+  return `${normalized}\n`;
+}
 
 type SandboxApplyPatchConfig = {
   root: string;
@@ -86,6 +97,7 @@ const applyPatchSchema = Type.Object({
   }),
 });
 
+/** Create the agent tool wrapper for applying patch-envelope input. */
 export function createApplyPatchTool(
   options: { cwd?: string; sandbox?: SandboxApplyPatchConfig; workspaceOnly?: boolean } = {},
 ): AgentTool<typeof applyPatchSchema, ApplyPatchToolDetails> {
@@ -106,9 +118,7 @@ export function createApplyPatchTool(
         throw new Error("Provide a patch input.");
       }
       if (signal?.aborted) {
-        const err = new Error("Aborted");
-        err.name = "AbortError";
-        throw err;
+        throw createAbortError("Aborted");
       }
 
       const result = await applyPatch(input, {
@@ -121,11 +131,13 @@ export function createApplyPatchTool(
       return {
         content: [{ type: "text", text: result.text }],
         details: { summary: result.summary },
+        ...(result.noOp ? { terminate: true } : {}),
       };
     },
   };
 }
 
+/** Parse and apply a patch envelope to the configured filesystem target. */
 export async function applyPatch(
   input: string,
   options: ApplyPatchOptions,
@@ -145,17 +157,17 @@ export async function applyPatch(
     modified: new Set<string>(),
     deleted: new Set<string>(),
   };
+  const noOpPaths = new Set<string>();
   const fileOps = resolvePatchFileOps(options);
 
   for (const hunk of parsed.hunks) {
     if (options.signal?.aborted) {
-      const err = new Error("Aborted");
-      err.name = "AbortError";
-      throw err;
+      throw createAbortError("Aborted");
     }
 
     if (hunk.kind === "add") {
       const target = await resolvePatchPath(hunk.path, options);
+      await assertPatchParentPath(hunk.path, options);
       await ensureDir(target.resolved, fileOps);
       await fileOps.writeFile(target.resolved, hunk.contents);
       recordSummary(summary, seen, "added", target.display);
@@ -171,24 +183,56 @@ export async function applyPatch(
 
     const target = await resolvePatchPath(hunk.path, options);
     const applied = await applyUpdateHunk(target.resolved, hunk.chunks, {
-      readFile: (path) => fileOps.readFile(path),
+      readFile: (pathLocal) => fileOps.readFile(pathLocal),
     });
 
     if (hunk.movePath) {
       const moveTarget = await resolvePatchPath(hunk.movePath, options);
+      await assertPatchParentPath(hunk.movePath, options);
       await ensureDir(moveTarget.resolved, fileOps);
-      await fileOps.writeFile(moveTarget.resolved, applied);
-      await fileOps.remove(target.resolved);
-      recordSummary(summary, seen, "modified", moveTarget.display);
+      const moveResolvesToSource =
+        path.resolve(moveTarget.resolved) === path.resolve(target.resolved);
+      const destination = moveResolvesToSource ? target.resolved : moveTarget.resolved;
+      if (moveResolvesToSource) {
+        const existing = await fileOps.readFile(target.resolved);
+        if (normalizeUpdateComparison(existing) === normalizeUpdateComparison(applied)) {
+          noOpPaths.add(target.display);
+        } else {
+          noOpPaths.delete(target.display);
+          await fileOps.writeFile(destination, applied);
+        }
+      } else {
+        noOpPaths.delete(target.display);
+        await fileOps.writeFile(destination, applied);
+      }
+      if (!moveResolvesToSource) {
+        await fileOps.remove(target.resolved);
+      }
+      if (!noOpPaths.has(target.display)) {
+        recordSummary(
+          summary,
+          seen,
+          "modified",
+          moveResolvesToSource ? target.display : moveTarget.display,
+        );
+      }
     } else {
-      await fileOps.writeFile(target.resolved, applied);
-      recordSummary(summary, seen, "modified", target.display);
+      const existing = await fileOps.readFile(target.resolved);
+      if (normalizeUpdateComparison(existing) === normalizeUpdateComparison(applied)) {
+        noOpPaths.add(target.display);
+      } else {
+        noOpPaths.delete(target.display);
+        await fileOps.writeFile(target.resolved, applied);
+        recordSummary(summary, seen, "modified", target.display);
+      }
     }
   }
 
+  const noOp = noOpPaths.size > 0 && Object.values(summary).every((paths) => paths.length === 0);
   return {
     summary,
-    text: formatSummary(summary),
+    text: noOp ? `No changes made to ${Array.from(noOpPaths).join(", ")}.` : formatSummary(summary),
+    ...(noOp ? { noOp: true } : {}),
   };
 }
 
@@ -244,12 +288,13 @@ function resolvePatchFileOps(options: ApplyPatchOptions): PatchFileOps {
     };
   }
   const workspaceOnly = options.workspaceOnly !== false;
+  const rootPromise = workspaceOnly ? fsRoot(options.cwd) : undefined;
   return {
     readFile: async (filePath) => {
       if (!workspaceOnly) {
         return await fs.readFile(filePath, "utf8");
       }
-      const opened = await openBoundaryFile({
+      const opened = await openRootFile({
         absolutePath: filePath,
         rootPath: options.cwd,
         boundaryLabel: "workspace root",
@@ -267,12 +312,7 @@ function resolvePatchFileOps(options: ApplyPatchOptions): PatchFileOps {
         return;
       }
       const relative = toRelativeSandboxPath(options.cwd, filePath);
-      await writeFileWithinRoot({
-        rootDir: options.cwd,
-        relativePath: relative,
-        data: content,
-        encoding: "utf8",
-      });
+      await (await rootPromise)?.write(relative, content, { encoding: "utf8" });
     },
     remove: async (filePath) => {
       if (!workspaceOnly) {
@@ -280,10 +320,7 @@ function resolvePatchFileOps(options: ApplyPatchOptions): PatchFileOps {
         return;
       }
       const relative = toRelativeSandboxPath(options.cwd, filePath);
-      await removePathWithinRoot({
-        rootDir: options.cwd,
-        relativePath: relative,
-      });
+      await (await rootPromise)?.remove(relative);
     },
     mkdirp: async (dir) => {
       if (!workspaceOnly) {
@@ -291,11 +328,15 @@ function resolvePatchFileOps(options: ApplyPatchOptions): PatchFileOps {
         return;
       }
       const relative = toRelativeSandboxPath(options.cwd, dir, { allowRoot: true });
-      await mkdirPathWithinRoot({
-        rootDir: options.cwd,
-        relativePath: relative,
-        allowRoot: true,
-      });
+      const root = await rootPromise;
+      if (!root) {
+        return;
+      }
+      if (relative === "" || relative === ".") {
+        await root.ensureRoot();
+        return;
+      }
+      await root.mkdir(relative);
     },
   };
 }
@@ -306,6 +347,54 @@ async function ensureDir(filePath: string, ops: PatchFileOps) {
     return;
   }
   await ops.mkdirp(parent);
+}
+
+async function assertPatchParentPath(filePath: string, options: ApplyPatchOptions) {
+  if (options.workspaceOnly === false || options.sandbox) {
+    return;
+  }
+  const parent = path.dirname(filePath);
+  if (!parent || parent === ".") {
+    return;
+  }
+  await assertSandboxPath({
+    filePath: parent,
+    cwd: options.cwd,
+    root: options.cwd,
+  });
+  await assertNoExistingParentAliases({
+    parentPath: resolvePathFromInput(parent, options.cwd),
+    rootPath: options.cwd,
+  });
+}
+
+async function assertNoExistingParentAliases(params: { parentPath: string; rootPath: string }) {
+  const rootPath = path.resolve(params.rootPath);
+  const parentPath = path.resolve(params.parentPath);
+  const relative = path.relative(rootPath, parentPath);
+  if (!relative || relative === "" || relativePathEscapesRoot(relative)) {
+    return;
+  }
+
+  let current = rootPath;
+  for (const segment of relative.split(path.sep)) {
+    if (!segment) {
+      continue;
+    }
+    current = path.join(current, segment);
+    const stat = await fs.lstat(current).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return null;
+      }
+      throw error;
+    });
+    if (!stat) {
+      return;
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Path alias under sandbox root: ${path.relative(rootPath, current)}`);
+    }
+  }
 }
 
 async function resolvePatchPath(
@@ -352,9 +441,9 @@ async function resolvePatchPath(
 }
 
 function assertBoundaryRead(
-  opened: BoundaryFileOpenResult,
+  opened: RootFileOpenResult,
   targetPath: string,
-): asserts opened is Extract<BoundaryFileOpenResult, { ok: true }> {
+): asserts opened is Extract<RootFileOpenResult, { ok: true }> {
   if (opened.ok) {
     return;
   }
@@ -367,10 +456,19 @@ function toDisplayPath(resolved: string, cwd: string): string {
   if (!relative || relative === "") {
     return path.basename(resolved);
   }
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+  if (relativePathEscapesRoot(relative)) {
     return resolved;
   }
   return relative;
+}
+
+function relativePathEscapesRoot(relativePath: string): boolean {
+  return (
+    relativePath === ".." ||
+    relativePath.startsWith("../") ||
+    relativePath.startsWith("..\\") ||
+    path.isAbsolute(relativePath)
+  );
 }
 
 function parsePatchText(input: string): { hunks: Hunk[]; patch: string } {
@@ -407,9 +505,13 @@ function checkPatchBoundariesLenient(lines: string[]): string[] {
     throw new Error(strictError);
   }
   const first = lines[0];
-  const last = lines[lines.length - 1];
-  if ((first === "<<EOF" || first === "<<'EOF'" || first === '<<"EOF"') && last.endsWith("EOF")) {
-    const inner = lines.slice(1, lines.length - 1);
+  const last = lines.at(-1);
+  if (
+    last &&
+    (first === "<<EOF" || first === "<<'EOF'" || first === '<<"EOF"') &&
+    last.endsWith("EOF")
+  ) {
+    const inner = lines.slice(1, -1);
     const innerError = checkPatchBoundariesStrict(inner);
     if (!innerError) {
       return inner;

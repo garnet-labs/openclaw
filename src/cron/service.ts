@@ -1,11 +1,26 @@
+/** Stateful CronService facade around the locked service operation helpers. */
+import type {
+  CronServiceContract,
+  CronServiceRunOptions,
+  CronServiceRunResult,
+} from "./service-contract.js";
+import type { CronListPageOptions } from "./service/list-page-types.js";
 import * as ops from "./service/ops.js";
-import { type CronServiceDeps, createCronServiceState } from "./service/state.js";
+import {
+  type CronAddOptions,
+  type CronServiceDeps,
+  type CronUpdatePrecondition,
+  type CronWakeMode,
+  createCronServiceState,
+} from "./service/state.js";
 import type { CronJob, CronJobCreate, CronJobPatch } from "./types.js";
 
 export type { CronEvent, CronServiceDeps } from "./service/state.js";
 
-export class CronService {
+/** Public cron service facade that owns mutable scheduler state and delegates to locked ops. */
+export class CronService implements CronServiceContract {
   private readonly state;
+
   constructor(deps: CronServiceDeps) {
     this.state = createCronServiceState(deps);
   }
@@ -26,35 +41,61 @@ export class CronService {
     return await ops.list(this.state, opts);
   }
 
-  async listPage(opts?: ops.CronListPageOptions) {
+  async listPage(opts?: CronListPageOptions) {
     return await ops.listPage(this.state, opts);
   }
 
-  async add(input: CronJobCreate) {
-    return await ops.add(this.state, input);
+  async add(input: CronJobCreate, opts?: CronAddOptions) {
+    return await ops.add(this.state, input, opts);
   }
 
   async update(id: string, patch: CronJobPatch) {
     return await ops.update(this.state, id, patch);
   }
 
+  async updateWithPrecondition(
+    id: string,
+    patch: CronJobPatch,
+    precondition: CronUpdatePrecondition,
+  ) {
+    return await ops.updateWithPrecondition(this.state, id, patch, precondition);
+  }
+
   async remove(id: string) {
     return await ops.remove(this.state, id);
   }
 
-  async run(id: string, mode?: "due" | "force") {
-    return await ops.run(this.state, id, mode);
+  async run(
+    id: string,
+    mode?: "due" | "force",
+    opts?: CronServiceRunOptions,
+  ): Promise<CronServiceRunResult> {
+    return await ops.run(this.state, id, mode, opts);
   }
 
-  async enqueueRun(id: string, mode?: "due" | "force") {
-    return await ops.enqueueRun(this.state, id, mode);
+  async enqueueRun(id: string, mode?: "due" | "force"): Promise<CronServiceRunResult> {
+    const result = await ops.enqueueRun(this.state, id, mode);
+    if (result.ok && "runnable" in result) {
+      // ops.enqueueRun resolves runnable dispositions before crossing the
+      // public facade; leaking one would expose an internal scheduler detail.
+      throw new Error("cron enqueueRun returned unresolved runnable disposition");
+    }
+    return result;
   }
 
   getJob(id: string): CronJob | undefined {
     return this.state.store?.jobs.find((job) => job.id === id);
   }
 
-  wake(opts: { mode: "now" | "next-heartbeat"; text: string }) {
+  async readJob(id: string): Promise<CronJob | undefined> {
+    return await ops.readJob(this.state, id);
+  }
+
+  getDefaultAgentId(): string | undefined {
+    return this.state.deps.defaultAgentId;
+  }
+
+  wake(opts: { mode: CronWakeMode; text: string; sessionKey?: string; agentId?: string }) {
     return ops.wakeNow(this.state, opts);
   }
 }

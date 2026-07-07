@@ -1,8 +1,16 @@
+/**
+ * Browser plugin runtime lifecycle helpers for startup and shutdown cleanup.
+ */
 import type { Server } from "node:http";
+import { getExtensionRelayModule } from "./extension-relay.runtime.js";
+import { getPwAiModule } from "./pw-ai-module.js";
 import { isPwAiLoaded } from "./pw-ai-state.js";
 import type { BrowserServerState } from "./server-context.js";
-import { ensureExtensionRelayForProfiles, stopKnownBrowserProfiles } from "./server-lifecycle.js";
+import { stopKnownBrowserProfiles } from "./server-lifecycle.js";
+import { startTrackedBrowserTabCleanupTimer } from "./session-tab-cleanup.js";
+import { registerBrowserUnhandledRejectionHandler } from "./unhandled-rejections.js";
 
+/** Creates Browser server state and starts runtime-wide cleanup handlers. */
 export async function createBrowserRuntimeState(params: {
   resolved: BrowserServerState["resolved"];
   port: number;
@@ -15,15 +23,16 @@ export async function createBrowserRuntimeState(params: {
     resolved: params.resolved,
     profiles: new Map(),
   };
-
-  await ensureExtensionRelayForProfiles({
-    resolved: params.resolved,
+  state.stopTrackedTabCleanup = startTrackedBrowserTabCleanupTimer({
     onWarn: params.onWarn,
   });
+
+  state.stopUnhandledRejectionHandler = registerBrowserUnhandledRejectionHandler();
 
   return state;
 }
 
+/** Stops Browser profiles, the optional HTTP server, and loaded Playwright state. */
 export async function stopBrowserRuntime(params: {
   current: BrowserServerState | null;
   getState: () => BrowserServerState | null;
@@ -34,27 +43,40 @@ export async function stopBrowserRuntime(params: {
   if (!params.current) {
     return;
   }
-
-  await stopKnownBrowserProfiles({
-    getState: params.getState,
-    onWarn: params.onWarn,
-  });
-
-  if (params.closeServer && params.current.server) {
-    await new Promise<void>((resolve) => {
-      params.current?.server?.close(() => resolve());
-    });
-  }
-
-  params.clearState();
-
-  if (!isPwAiLoaded()) {
-    return;
-  }
   try {
-    const mod = await import("./pw-ai.js");
-    await mod.closePlaywrightBrowserConnection();
-  } catch {
-    // ignore
+    params.current.stopTrackedTabCleanup?.();
+
+    await stopKnownBrowserProfiles({
+      getState: params.getState,
+      onWarn: params.onWarn,
+    });
+
+    if (params.current.extensionRelays?.size) {
+      const { stopExtensionRelays } = await getExtensionRelayModule();
+      await stopExtensionRelays(params.current);
+      const { disposeGatewayExtensionRelay } =
+        await import("./extension-relay/gateway-relay-route.js");
+      disposeGatewayExtensionRelay();
+    }
+
+    if (params.closeServer && params.current.server) {
+      await new Promise<void>((resolve) => {
+        params.current?.server?.close(() => resolve());
+      });
+    }
+
+    params.clearState();
+
+    if (!isPwAiLoaded()) {
+      return;
+    }
+    try {
+      const mod = await getPwAiModule({ mode: "soft" });
+      await mod?.closePlaywrightBrowserConnection();
+    } catch {
+      // ignore
+    }
+  } finally {
+    params.current.stopUnhandledRejectionHandler?.();
   }
 }

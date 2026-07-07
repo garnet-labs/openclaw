@@ -1,3 +1,8 @@
+/**
+ * Bash process registry tests.
+ * Covers output caps, finished-session retention, cleanup, and PTY cursor mode
+ * state for background exec sessions.
+ */
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProcessSession } from "./bash-process-registry.js";
@@ -9,6 +14,7 @@ import {
   markBackgrounded,
   markExited,
   resetProcessRegistryForTests,
+  tail,
 } from "./bash-process-registry.js";
 import { createProcessSessionFixture } from "./bash-process-registry.test-helpers.js";
 
@@ -99,6 +105,37 @@ describe("bash process registry", () => {
     expect(session.truncated).toBe(true);
   });
 
+  it("keeps aggregate, pending, and tail suffix cuts on UTF-16 boundaries", () => {
+    const session = createRegistrySession({
+      maxOutputChars: 3,
+      pendingMaxOutputChars: 3,
+      backgrounded: true,
+    });
+
+    addSession(session);
+    appendOutput(session, "stdout", "a🎉bc");
+
+    expect(session.aggregated).toBe("bc");
+    expect(session.pendingStdoutChars).toBe(2);
+    expect(drainSession(session).stdout).toBe("bc");
+    expect(tail("a🎉bc", 3)).toBe("bc");
+  });
+
+  it("keeps multi-chunk pending output on a UTF-16 boundary", () => {
+    const session = createRegistrySession({
+      maxOutputChars: 100,
+      pendingMaxOutputChars: 3,
+      backgrounded: true,
+    });
+
+    addSession(session);
+    appendOutput(session, "stdout", "a🎉");
+    appendOutput(session, "stdout", "bc");
+
+    expect(session.pendingStdoutChars).toBe(2);
+    expect(drainSession(session).stdout).toBe("bc");
+  });
+
   it("only persists finished sessions when backgrounded", () => {
     const session = createRegistrySession({
       maxOutputChars: 100,
@@ -112,7 +149,27 @@ describe("bash process registry", () => {
 
     markBackgrounded(session);
     markExited(session, 0, null, "completed");
-    expect(listFinishedSessions()).toHaveLength(1);
+    const finishedSessions = listFinishedSessions();
+    const endedAt = finishedSessions[0]?.endedAt;
+    expect(endedAt).toEqual(expect.any(Number));
+    expect(finishedSessions).toStrictEqual([
+      {
+        id: "sess",
+        command: "echo test",
+        scopeKey: undefined,
+        startedAt: session.startedAt,
+        endedAt,
+        cwd: "/tmp",
+        status: "completed",
+        exitCode: 0,
+        exitSignal: null,
+        exitReason: undefined,
+        aggregated: "",
+        tail: "",
+        truncated: false,
+        totalOutputChars: 0,
+      },
+    ]);
   });
 });
 

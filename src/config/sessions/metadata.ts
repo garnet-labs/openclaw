@@ -1,15 +1,25 @@
-import type { MsgContext } from "../../auto-reply/templating.js";
-import { normalizeChatType } from "../../channels/chat-type.js";
-import { resolveConversationLabel } from "../../channels/conversation-label.js";
-import { getChannelPlugin, normalizeChannelId } from "../../channels/plugins/index.js";
+// Session metadata derives stable origin, group, and display fields from message context.
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
-} from "../../shared/string-coerce.js";
-import { normalizeMessageChannel } from "../../utils/message-channel.js";
+} from "@openclaw/normalization-core/string-coerce";
+import type { MsgContext } from "../../auto-reply/templating.js";
+import { normalizeChatType } from "../../channels/chat-type.js";
+import { resolveConversationLabel } from "../../channels/conversation-label.js";
+import { getLoadedChannelPlugin, normalizeChannelId } from "../../channels/plugins/index.js";
+import {
+  INTERNAL_MESSAGE_CHANNEL,
+  isInternalNonDeliveryChannel,
+  normalizeMessageChannel,
+} from "../../utils/message-channel.js";
 import { buildGroupDisplayName, resolveGroupSessionKey } from "./group.js";
 import type { GroupKeyResolution, SessionEntry, SessionOrigin } from "./types.js";
 
+function isSystemEventProvider(provider?: string): boolean {
+  return provider === "heartbeat" || provider === "cron-event" || provider === "exec-event";
+}
+
+// Origin updates merge sparse channel metadata without deleting previously known fields.
 const mergeOrigin = (
   existing: SessionOrigin | undefined,
   next: SessionOrigin | undefined,
@@ -18,6 +28,30 @@ const mergeOrigin = (
     return undefined;
   }
   const merged: SessionOrigin = existing ? { ...existing } : {};
+  // A provider/surface/account change is a fresh channel identity (e.g. a dmScope:"main" session
+  // moving Slack -> Telegram, or between Slack accounts). Channel-keyed fields belong to the prior
+  // channel; drop them so an inbound that omits them does not keep reactions, native threading, and
+  // status reads pointed at the previous channel.
+  const nextProvider = next?.provider;
+  const nextIsDeliverableChannel =
+    nextProvider != null &&
+    nextProvider !== INTERNAL_MESSAGE_CHANNEL &&
+    !isInternalNonDeliveryChannel(nextProvider) &&
+    !isSystemEventProvider(nextProvider);
+  const channelChanged =
+    existing != null &&
+    nextIsDeliverableChannel &&
+    ((existing.provider != null && nextProvider !== existing.provider) ||
+      (existing.surface != null && next?.surface != null && next.surface !== existing.surface) ||
+      (existing.accountId != null &&
+        next?.accountId != null &&
+        next.accountId !== existing.accountId));
+  if (channelChanged) {
+    delete merged.nativeChannelId;
+    delete merged.nativeDirectUserId;
+    delete merged.accountId;
+    delete merged.threadId;
+  }
   if (next?.label) {
     merged.label = next.label;
   }
@@ -51,7 +85,14 @@ const mergeOrigin = (
   return Object.keys(merged).length > 0 ? merged : undefined;
 };
 
-export function deriveSessionOrigin(ctx: MsgContext): SessionOrigin | undefined {
+/** Derives session origin metadata from an inbound message context. */
+export function deriveSessionOrigin(
+  ctx: MsgContext,
+  opts?: { skipSystemEventOrigin?: boolean },
+): SessionOrigin | undefined {
+  if (opts?.skipSystemEventOrigin && isSystemEventProvider(ctx.Provider)) {
+    return undefined;
+  }
   const label = normalizeOptionalString(resolveConversationLabel(ctx));
   const providerRaw =
     (typeof ctx.OriginatingChannel === "string" && ctx.OriginatingChannel) ||
@@ -126,14 +167,18 @@ export function deriveGroupSessionPatch(params: {
   const subject = params.ctx.GroupSubject?.trim();
   const space = params.ctx.GroupSpace?.trim();
   const explicitChannel = params.ctx.GroupChannel?.trim();
-  const normalizedChannel = normalizeChannelId(channel);
+  const subjectLooksChannel = Boolean(subject?.startsWith("#"));
+  // Channel-looking subjects become `groupChannel` only for channel-capable providers; ordinary
+  // group chats keep the subject as human-readable metadata.
+  const normalizedChannel =
+    subjectLooksChannel && resolution.chatType !== "channel" ? normalizeChannelId(channel) : null;
   const isChannelProvider = Boolean(
     normalizedChannel &&
-    getChannelPlugin(normalizedChannel)?.capabilities.chatTypes.includes("channel"),
+    getLoadedChannelPlugin(normalizedChannel)?.capabilities.chatTypes.includes("channel"),
   );
   const nextGroupChannel =
     explicitChannel ??
-    ((resolution.chatType === "channel" || isChannelProvider) && subject && subject.startsWith("#")
+    (subjectLooksChannel && subject && (resolution.chatType === "channel" || isChannelProvider)
       ? subject
       : undefined);
   const nextSubject = nextGroupChannel ? undefined : subject;
@@ -173,9 +218,12 @@ export function deriveSessionMetaPatch(params: {
   sessionKey: string;
   existing?: SessionEntry;
   groupResolution?: GroupKeyResolution | null;
+  skipSystemEventOrigin?: boolean;
 }): Partial<SessionEntry> | null {
   const groupPatch = deriveGroupSessionPatch(params);
-  const origin = deriveSessionOrigin(params.ctx);
+  const origin = deriveSessionOrigin(params.ctx, {
+    skipSystemEventOrigin: params.skipSystemEventOrigin,
+  });
   if (!groupPatch && !origin) {
     return null;
   }

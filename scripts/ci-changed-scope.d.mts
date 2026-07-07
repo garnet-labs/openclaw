@@ -1,6 +1,7 @@
 export type ChangedScope = {
   runNode: boolean;
   runMacos: boolean;
+  runIosBuild: boolean;
   runAndroid: boolean;
   runWindows: boolean;
   runSkillsPython: boolean;
@@ -8,6 +9,39 @@ export type ChangedScope = {
   runControlUiI18n: boolean;
 };
 
+export type InstallSmokeScope = {
+  runFastInstallSmoke: boolean;
+  runFullInstallSmoke: boolean;
+};
+
+export type NodeFastScope = {
+  runFastOnly: boolean;
+  runPluginContracts: boolean;
+  runCiRouting: boolean;
+};
+
+export type ChangedScopeArgs = {
+  base: string;
+  head: string;
+  mergeHeadFirstParent: boolean;
+};
+
 export function detectChangedScope(changedPaths: string[]): ChangedScope;
-export function listChangedPaths(base: string, head?: string): string[];
-export function writeGitHubOutput(scope: ChangedScope, outputPath?: string): void;
+export function shouldRunNativeI18n(changedPaths: string[]): boolean;
+export function detectNodeFastScope(changedPaths: string[]): NodeFastScope;
+export function detectInstallSmokeScope(changedPaths: string[]): InstallSmokeScope;
+export function listChangedPaths(
+  base: string,
+  head?: string,
+  cwd?: string,
+  preferMergeHeadFirstParent?: boolean,
+): string[];
+export function writeGitHubOutput(
+  scope: ChangedScope,
+  outputPath?: string,
+  installSmokeScope?: InstallSmokeScope,
+  nodeFastScope?: NodeFastScope,
+  runNativeI18n?: boolean,
+): void;
+
+export function parseArgs(argv: string[]): ChangedScopeArgs;

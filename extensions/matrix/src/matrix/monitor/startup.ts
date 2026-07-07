@@ -1,3 +1,5 @@
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+// Matrix plugin module implements startup behavior.
 import type { RuntimeLogger } from "../../runtime-api.js";
 import type { CoreConfig, MatrixConfig } from "../../types.js";
 import type { MatrixAuth } from "../client.js";
@@ -24,10 +26,8 @@ export type MatrixStartupMaintenanceDeps = {
   ensureMatrixStartupVerification: typeof import("./startup-verification.js").ensureMatrixStartupVerification;
 };
 
-let matrixStartupMaintenanceDepsPromise: Promise<MatrixStartupMaintenanceDeps> | undefined;
-
-async function loadMatrixStartupMaintenanceDeps(): Promise<MatrixStartupMaintenanceDeps> {
-  matrixStartupMaintenanceDepsPromise ??= Promise.all([
+const loadMatrixStartupMaintenanceDeps = createLazyRuntimeModule(() =>
+  Promise.all([
     import("../config-update.js"),
     import("../device-health.js"),
     import("../profile.js"),
@@ -47,9 +47,8 @@ async function loadMatrixStartupMaintenanceDeps(): Promise<MatrixStartupMaintena
       maybeRestoreLegacyMatrixBackup: legacyCryptoRestoreModule.maybeRestoreLegacyMatrixBackup,
       ensureMatrixStartupVerification: startupVerificationModule.ensureMatrixStartupVerification,
     }),
-  );
-  return await matrixStartupMaintenanceDepsPromise;
-}
+  ),
+);
 
 export async function runMatrixStartupMaintenance(
   params: {
@@ -60,8 +59,8 @@ export async function runMatrixStartupMaintenance(
     accountConfig: MatrixConfig;
     logger: RuntimeLogger;
     logVerboseMessage: (message: string) => void;
-    loadConfig: () => CoreConfig;
-    writeConfigFile: (cfg: never) => Promise<void>;
+    getRuntimeConfig: () => CoreConfig;
+    replaceConfigFile: (cfg: never) => Promise<void>;
     loadWebMedia: (
       url: string,
       maxBytes: number,
@@ -93,11 +92,11 @@ export async function runMatrixStartupMaintenance(
       profileSync.resolvedAvatarUrl &&
       params.accountConfig.avatarUrl !== profileSync.resolvedAvatarUrl
     ) {
-      const latestCfg = params.loadConfig();
+      const latestCfg = params.getRuntimeConfig();
       const updatedCfg = runtimeDeps.updateMatrixAccountConfig(latestCfg, params.accountId, {
         avatarUrl: profileSync.resolvedAvatarUrl,
       });
-      await params.writeConfigFile(updatedCfg as never);
+      await params.replaceConfigFile(updatedCfg as never);
       throwIfMatrixStartupAborted(params.abortSignal);
       params.logVerboseMessage(
         `matrix: persisted converted avatar URL for account ${params.accountId} (${profileSync.resolvedAvatarUrl})`,

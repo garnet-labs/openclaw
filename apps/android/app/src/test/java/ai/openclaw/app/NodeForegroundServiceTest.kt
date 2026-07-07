@@ -2,6 +2,7 @@ package ai.openclaw.app
 
 import android.app.Notification
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Test
@@ -28,6 +29,43 @@ class NodeForegroundServiceTest {
 
     val expectedFlags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
     assertEquals(expectedFlags, savedIntent.flags and expectedFlags)
+  }
+
+  @Test
+  fun foregroundServiceTypes_addsOnlyActiveSensitiveTypes() {
+    assertEquals(
+      ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+      foregroundServiceTypes(VoiceCaptureMode.Off, backgroundLocationActive = false),
+    )
+    assertEquals(
+      ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+      foregroundServiceTypes(VoiceCaptureMode.ManualMic, backgroundLocationActive = false),
+    )
+    assertEquals(
+      ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION,
+      foregroundServiceTypes(VoiceCaptureMode.TalkMode, backgroundLocationActive = true),
+    )
+  }
+
+  @Test
+  fun backgroundLocationNotificationSuffix_disclosesActiveAlwaysMode() {
+    assertEquals("", backgroundLocationNotificationSuffix(active = false))
+    assertEquals(" · Location: Always", backgroundLocationNotificationSuffix(active = true))
+  }
+
+  @Test
+  fun voiceNotificationSuffixReflectsActiveCaptureMode() {
+    assertEquals("", voiceNotificationSuffix(VoiceCaptureMode.Off, false, false, false, false))
+    assertEquals(
+      " · Mic: Listening",
+      voiceNotificationSuffix(VoiceCaptureMode.ManualMic, true, true, false, false),
+    )
+    assertEquals(
+      " · Talk: Speaking",
+      voiceNotificationSuffix(VoiceCaptureMode.TalkMode, false, false, true, true),
+    )
   }
 
   private fun buildNotification(service: NodeForegroundService): Notification {

@@ -1,5 +1,7 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+// Tests setup code generation and environment-derived defaults.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SecretInput } from "../config/types.secrets.js";
+import { captureEnv } from "../test-utils/env.js";
 
 vi.mock("../infra/device-bootstrap.js", () => ({
   issueDeviceBootstrapToken: vi.fn(async () => ({
@@ -8,9 +10,9 @@ vi.mock("../infra/device-bootstrap.js", () => ({
   })),
 }));
 
-let encodePairingSetupCode: typeof import("./setup-code.js").encodePairingSetupCode;
-let resolvePairingSetupFromConfig: typeof import("./setup-code.js").resolvePairingSetupFromConfig;
-let issueDeviceBootstrapTokenMock: typeof import("../infra/device-bootstrap.js").issueDeviceBootstrapToken;
+const { encodePairingSetupCode, resolvePairingSetupFromConfig } = await import("./setup-code.js");
+const { issueDeviceBootstrapToken: issueDeviceBootstrapTokenMock } =
+  await import("../infra/device-bootstrap.js");
 
 describe("pairing setup code", () => {
   type ResolvedSetup = Awaited<ReturnType<typeof resolvePairingSetupFromConfig>>;
@@ -57,6 +59,36 @@ describe("pairing setup code", () => {
     }));
   }
 
+  function createTailnetIpRunner() {
+    return vi.fn(async () => ({
+      code: 0,
+      stdout: '{"Self":{"TailscaleIPs":["100.64.0.9"]}}',
+      stderr: "",
+    }));
+  }
+
+  function createNoRouteRunner() {
+    return vi.fn(async () => ({
+      code: 1,
+      stdout: "",
+      stderr: "",
+    }));
+  }
+
+  function createDefaultRouteRunner(interfaceName: string) {
+    const stdout =
+      process.platform === "win32"
+        ? JSON.stringify({ InterfaceAlias: interfaceName })
+        : process.platform === "linux"
+          ? `default via 10.211.55.1 dev ${interfaceName} proto dhcp metric 100\n`
+          : `   route to: default\ninterface: ${interfaceName}\n`;
+    return vi.fn(async () => ({
+      code: 0,
+      stdout,
+      stderr: "",
+    }));
+  }
+
   function createIpv4NetworkInterfaces(
     address: string,
   ): ReturnType<NonNullable<NonNullable<ResolveSetupOptions>["networkInterfaces"]>> {
@@ -79,6 +111,7 @@ describe("pairing setup code", () => {
     params: {
       authLabel: string;
       url?: string;
+      urls?: string[];
       urlSource?: string;
     },
   ) {
@@ -88,21 +121,18 @@ describe("pairing setup code", () => {
     }
     expect(resolved.authLabel).toBe(params.authLabel);
     expect(resolved.payload.bootstrapToken).toBe("bootstrap-123");
-    expect(issueDeviceBootstrapTokenMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        profile: {
-          roles: ["node", "operator"],
-          scopes: [
-            "operator.approvals",
-            "operator.read",
-            "operator.talk.secrets",
-            "operator.write",
-          ],
-        },
-      }),
-    );
+    expect(issueDeviceBootstrapTokenMock).toHaveBeenCalledWith({
+      baseDir: undefined,
+      profile: {
+        roles: ["node", "operator"],
+        scopes: ["operator.approvals", "operator.read", "operator.talk.secrets", "operator.write"],
+      },
+    });
     if (params.url) {
       expect(resolved.payload.url).toBe(params.url);
+    }
+    if (params.urls) {
+      expect(resolved.payload.urls).toEqual(params.urls);
     }
     if (params.urlSource) {
       expect(resolved.urlSource).toBe(params.urlSource);
@@ -123,6 +153,7 @@ describe("pairing setup code", () => {
     expected: {
       authLabel: string;
       url: string;
+      urls?: string[];
       urlSource: string;
     };
     runCommandWithTimeout?: ReturnType<typeof vi.fn>;
@@ -179,16 +210,17 @@ describe("pairing setup code", () => {
     expectResolvedSetupOk(resolved, { authLabel: params.expectedAuthLabel });
   }
 
-  beforeEach(() => {
-    vi.stubEnv("OPENCLAW_GATEWAY_TOKEN", "");
-    vi.stubEnv("OPENCLAW_GATEWAY_PASSWORD", "");
-    vi.stubEnv("OPENCLAW_GATEWAY_PORT", "");
-  });
+  let gatewayEnvSnapshot: ReturnType<typeof captureEnv> | undefined;
 
-  beforeAll(async () => {
-    ({ encodePairingSetupCode, resolvePairingSetupFromConfig } = await import("./setup-code.js"));
-    ({ issueDeviceBootstrapToken: issueDeviceBootstrapTokenMock } =
-      await import("../infra/device-bootstrap.js"));
+  beforeEach(() => {
+    gatewayEnvSnapshot = captureEnv([
+      "OPENCLAW_GATEWAY_TOKEN",
+      "OPENCLAW_GATEWAY_PASSWORD",
+      "OPENCLAW_GATEWAY_PORT",
+    ]);
+    process.env.OPENCLAW_GATEWAY_TOKEN = "";
+    process.env.OPENCLAW_GATEWAY_PASSWORD = "";
+    process.env.OPENCLAW_GATEWAY_PORT = "";
   });
 
   beforeEach(() => {
@@ -196,7 +228,8 @@ describe("pairing setup code", () => {
   });
 
   afterEach(() => {
-    vi.unstubAllEnvs();
+    gatewayEnvSnapshot?.restore();
+    gatewayEnvSnapshot = undefined;
   });
 
   it.each([
@@ -211,6 +244,60 @@ describe("pairing setup code", () => {
     },
   ] as const)("$name", ({ payload, expected }) => {
     expect(encodePairingSetupCode(payload)).toBe(expected);
+  });
+
+  it("normalizes bare publicUrl host ports for setup code payloads", async () => {
+    await expectResolvedSetupSuccessCase({
+      config: createCustomGatewayConfig({ mode: "token", token: "tok_123" }),
+      options: {
+        forceSecure: true,
+        publicUrl: "gateway.example.test:18789/setup",
+      },
+      expected: {
+        authLabel: "token",
+        url: "wss://gateway.example.test:18789",
+        urlSource: "plugins.entries.device-pair.config.publicUrl",
+      },
+    });
+  });
+
+  it("rejects invalid gateway.remote.url before falling back to bind-derived setup urls", async () => {
+    await expectResolvedSetupFailureCase({
+      config: {
+        gateway: {
+          bind: "custom",
+          customBindHost: "127.0.0.1",
+          remote: { url: "http://localhost:notaport" },
+          auth: { mode: "token", token: "tok_123" },
+        },
+      },
+      options: {
+        preferRemoteUrl: true,
+      },
+      expectedError: "Configured gateway.remote.url is invalid.",
+    });
+    expect(issueDeviceBootstrapTokenMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "localhost:notaport",
+    "http://localhost:notaport",
+    "http:gateway.example.test",
+    "ws:gateway.example.test",
+    "http:/localhost:notaport",
+    "ftp:/gateway.example.test",
+    "mailto:foo@example.com",
+    "ws://user:pass@gateway.example.test:18789",
+  ])("rejects invalid publicUrl %s before issuing setup code payloads", async (publicUrl) => {
+    await expectResolvedSetupFailureCase({
+      config: createCustomGatewayConfig({ mode: "token", token: "tok_123" }),
+      options: {
+        forceSecure: true,
+        publicUrl,
+      },
+      expectedError: "Configured publicUrl is invalid.",
+    });
+    expect(issueDeviceBootstrapTokenMock).not.toHaveBeenCalled();
   });
 
   async function resolveCustomGatewaySetup(params: {
@@ -420,6 +507,21 @@ describe("pairing setup code", () => {
       },
     },
     {
+      name: "allows mdns cleartext setup urls",
+      config: {
+        gateway: {
+          bind: "custom",
+          customBindHost: "gateway.local",
+          auth: { mode: "token", token: "tok_123" },
+        },
+      } satisfies ResolveSetupConfig,
+      expected: {
+        authLabel: "token",
+        url: "ws://gateway.local:18789",
+        urlSource: "gateway.bind=custom",
+      },
+    },
+    {
       name: "allows lan ip cleartext setup urls",
       config: {
         gateway: {
@@ -431,21 +533,6 @@ describe("pairing setup code", () => {
       expected: {
         authLabel: "token",
         url: "ws://192.168.1.20:18789",
-        urlSource: "gateway.bind=custom",
-      },
-    },
-    {
-      name: "allows mdns hostname cleartext setup urls",
-      config: {
-        gateway: {
-          bind: "custom",
-          customBindHost: "gateway.local",
-          auth: { mode: "token", token: "tok_123" },
-        },
-      } satisfies ResolveSetupConfig,
-      expected: {
-        authLabel: "token",
-        url: "ws://gateway.local:18789",
         urlSource: "gateway.bind=custom",
       },
     },
@@ -491,6 +578,7 @@ describe("pairing setup code", () => {
   });
 
   it("allows lan bind cleartext setup urls for mobile pairing", async () => {
+    const runCommandWithTimeout = createNoRouteRunner();
     await expectResolvedSetupSuccessCase({
       config: {
         gateway: {
@@ -500,11 +588,147 @@ describe("pairing setup code", () => {
       } satisfies ResolveSetupConfig,
       options: {
         networkInterfaces: () => createIpv4NetworkInterfaces("192.168.1.20"),
+        runCommandWithTimeout,
       } satisfies ResolveSetupOptions,
       expected: {
         authLabel: "password",
         url: "ws://192.168.1.20:18789",
         urlSource: "gateway.bind=lan",
+      },
+      runCommandWithTimeout,
+      expectedRunCommandCalls: 3,
+    });
+  });
+
+  it("advertises the routed LAN interface instead of the first private interface", async () => {
+    const runCommandWithTimeout = createDefaultRouteRunner("en1");
+    await expectResolvedSetupSuccessCase({
+      config: {
+        gateway: {
+          bind: "lan",
+          auth: { mode: "password", password: "secret" },
+        },
+      } satisfies ResolveSetupConfig,
+      options: {
+        networkInterfaces: () =>
+          ({
+            bridge100: [
+              {
+                address: "10.37.129.4",
+                family: "IPv4",
+                internal: false,
+                netmask: "255.255.255.0",
+                mac: "00:00:00:00:00:00",
+                cidr: "10.37.129.4/24",
+              },
+            ],
+            en1: [
+              {
+                address: "10.211.55.3",
+                family: "IPv4",
+                internal: false,
+                netmask: "255.255.255.0",
+                mac: "00:00:00:00:00:00",
+                cidr: "10.211.55.3/24",
+              },
+            ],
+          }) as ReturnType<NonNullable<NonNullable<ResolveSetupOptions>["networkInterfaces"]>>,
+        runCommandWithTimeout,
+      } satisfies ResolveSetupOptions,
+      expected: {
+        authLabel: "password",
+        url: "ws://10.211.55.3:18789",
+        urlSource: "gateway.bind=lan",
+      },
+      runCommandWithTimeout,
+      expectedRunCommandCalls: 3,
+    });
+  });
+
+  it("adds a configured Tailscale Serve route to a LAN setup code", async () => {
+    const defaultRoute = createDefaultRouteRunner("en0");
+    const runCommandWithTimeout = vi.fn(async (argv: string[]) => {
+      if (argv.includes("serve")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            TCP: { "8443": { HTTPS: true } },
+            Web: {
+              "clawmac.tail.ts.net:8443": {
+                Handlers: { "/": { Proxy: "http://127.0.0.1:18789" } },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      return defaultRoute();
+    });
+
+    await expectResolvedSetupSuccessCase({
+      config: {
+        gateway: {
+          bind: "lan",
+          auth: { mode: "token", token: "tok_123" },
+        },
+      } satisfies ResolveSetupConfig,
+      options: {
+        networkInterfaces: () => createIpv4NetworkInterfaces("192.168.139.3"),
+        runCommandWithTimeout,
+      } satisfies ResolveSetupOptions,
+      expected: {
+        authLabel: "token",
+        url: "ws://192.168.139.3:18789",
+        urls: ["ws://192.168.139.3:18789", "wss://clawmac.tail.ts.net:8443"],
+        urlSource: "gateway.bind=lan",
+      },
+      runCommandWithTimeout,
+      expectedRunCommandCalls: 2,
+    });
+  });
+
+  it("does not advertise a loopback Serve route for a custom bind", async () => {
+    const runCommandWithTimeout = vi.fn(async () => {
+      throw new Error("Tailscale Serve discovery must not run for a custom bind");
+    });
+
+    await expectResolvedSetupSuccessCase({
+      config: {
+        gateway: {
+          bind: "custom",
+          customBindHost: "192.168.139.3",
+          auth: { mode: "token", token: "tok_123" },
+        },
+      } satisfies ResolveSetupConfig,
+      options: { runCommandWithTimeout } satisfies ResolveSetupOptions,
+      expected: {
+        authLabel: "token",
+        url: "ws://192.168.139.3:18789",
+        urlSource: "gateway.bind=custom",
+      },
+      runCommandWithTimeout,
+      expectedRunCommandCalls: 0,
+    });
+  });
+
+  it("allows tailnet bind setup urls when gateway TLS is enabled", async () => {
+    await expectResolvedSetupSuccessCase({
+      config: {
+        gateway: {
+          bind: "tailnet",
+          tls: {
+            enabled: true,
+          },
+          auth: { mode: "token", token: "tok_123" },
+        },
+      } satisfies ResolveSetupConfig,
+      options: {
+        networkInterfaces: () => createIpv4NetworkInterfaces("100.64.0.9"),
+      } satisfies ResolveSetupOptions,
+      expected: {
+        authLabel: "token",
+        url: "wss://100.64.0.9:18789",
+        urlSource: "gateway.bind=tailnet",
       },
     });
   });
@@ -569,6 +793,30 @@ describe("pairing setup code", () => {
       },
     },
     {
+      name: "uses configured Tailscale Service DNS when available",
+      createOptions: () => {
+        const runCommandWithTimeout = createTailnetDnsRunner();
+        return {
+          options: {
+            runCommandWithTimeout,
+          } satisfies ResolveSetupOptions,
+          runCommandWithTimeout,
+          expectedRunCommandCalls: 1,
+        };
+      },
+      config: {
+        gateway: {
+          tailscale: { mode: "serve", serviceName: "svc:openclaw" },
+          auth: { mode: "password", password: "secret" },
+        },
+      } satisfies ResolveSetupConfig,
+      expected: {
+        authLabel: "password",
+        url: "wss://openclaw.tailnet.ts.net",
+        urlSource: "gateway.tailscale.mode=serve",
+      },
+    },
+    {
       name: "prefers gateway.remote.url over tailscale when requested",
       createOptions: () => {
         const runCommandWithTimeout = createTailnetDnsRunner();
@@ -602,6 +850,21 @@ describe("pairing setup code", () => {
       expected,
       runCommandWithTimeout,
       expectedRunCommandCalls,
+    });
+  });
+
+  it("does not advertise a node-IP URL for named Tailscale Services", async () => {
+    await expectResolvedSetupFailureCase({
+      config: {
+        gateway: {
+          tailscale: { mode: "serve", serviceName: "svc:openclaw" },
+          auth: { mode: "password", password: "secret" },
+        },
+      } satisfies ResolveSetupConfig,
+      options: {
+        runCommandWithTimeout: createTailnetIpRunner(),
+      } satisfies ResolveSetupOptions,
+      expectedError: "Service MagicDNS could not be derived",
     });
   });
 });

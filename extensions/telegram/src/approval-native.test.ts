@@ -1,10 +1,9 @@
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { saveSessionStore, type SessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
 import { describe, expect, it } from "vitest";
-import { clearSessionStoreCacheForTest } from "../../../src/config/sessions.js";
-import { telegramApprovalCapability, telegramNativeApprovalAdapter } from "./approval-native.js";
+import { telegramApprovalCapability } from "./approval-native.js";
 
 function buildConfig(
   overrides?: Partial<NonNullable<NonNullable<OpenClawConfig["channels"]>["telegram"]>>,
@@ -26,9 +25,10 @@ function buildConfig(
 
 const STORE_PATH = path.join(os.tmpdir(), "openclaw-telegram-approval-native-test.json");
 
-function writeStore(store: Record<string, unknown>) {
-  fs.writeFileSync(STORE_PATH, `${JSON.stringify(store, null, 2)}\n`, "utf8");
-  clearSessionStoreCacheForTest();
+async function writeStore(store: Record<string, unknown>) {
+  await saveSessionStore(STORE_PATH, store as Record<string, SessionEntry>, {
+    skipMaintenance: true,
+  });
 }
 
 describe("telegram native approval adapter", () => {
@@ -39,8 +39,9 @@ describe("telegram native approval adapter", () => {
     });
 
     expect(text).toContain("`channels.telegram.execApprovals.approvers`");
-    expect(text).toContain("`channels.telegram.allowFrom`");
-    expect(text).toContain("`channels.telegram.defaultTo`");
+    expect(text).toContain("`commands.ownerAllowFrom`");
+    expect(text).not.toContain("`channels.telegram.allowFrom`");
+    expect(text).not.toContain("`channels.telegram.defaultTo`");
     expect(text).not.toContain("`channels.telegram.dm.allowFrom`");
   });
 
@@ -52,13 +53,14 @@ describe("telegram native approval adapter", () => {
     });
 
     expect(text).toContain("`channels.telegram.accounts.work.execApprovals.approvers`");
-    expect(text).toContain("`channels.telegram.accounts.work.allowFrom`");
-    expect(text).toContain("`channels.telegram.accounts.work.defaultTo`");
+    expect(text).toContain("`commands.ownerAllowFrom`");
+    expect(text).not.toContain("`channels.telegram.accounts.work.allowFrom`");
+    expect(text).not.toContain("`channels.telegram.accounts.work.defaultTo`");
     expect(text).not.toContain("`channels.telegram.allowFrom`");
   });
 
   it("normalizes direct-chat origin targets so DM dedupe can converge", async () => {
-    const target = await telegramNativeApprovalAdapter.native?.resolveOriginTarget?.({
+    const target = await telegramApprovalCapability.native?.resolveOriginTarget?.({
       cfg: buildConfig(),
       accountId: "default",
       approvalKind: "exec",
@@ -83,7 +85,7 @@ describe("telegram native approval adapter", () => {
   });
 
   it("parses topic-scoped turn-source targets in the extension", async () => {
-    const target = await telegramNativeApprovalAdapter.native?.resolveOriginTarget?.({
+    const target = await telegramApprovalCapability.native?.resolveOriginTarget?.({
       cfg: buildConfig(),
       accountId: "default",
       approvalKind: "exec",
@@ -108,7 +110,7 @@ describe("telegram native approval adapter", () => {
   });
 
   it("falls back to the session-bound origin target for plugin approvals", async () => {
-    writeStore({
+    await writeStore({
       "agent:main:telegram:group:-1003841603622:topic:928": {
         sessionId: "sess",
         updatedAt: Date.now(),
@@ -121,7 +123,7 @@ describe("telegram native approval adapter", () => {
       },
     });
 
-    const target = await telegramNativeApprovalAdapter.native?.resolveOriginTarget?.({
+    const target = await telegramApprovalCapability.native?.resolveOriginTarget?.({
       cfg: {
         ...buildConfig(),
         session: { store: STORE_PATH },
@@ -147,7 +149,7 @@ describe("telegram native approval adapter", () => {
   });
 
   it("parses numeric string thread ids from the session store for plugin approvals", async () => {
-    writeStore({
+    await writeStore({
       "agent:main:telegram:group:-1003841603622:topic:928": {
         sessionId: "sess",
         updatedAt: Date.now(),
@@ -160,7 +162,7 @@ describe("telegram native approval adapter", () => {
       },
     });
 
-    const target = await telegramNativeApprovalAdapter.native?.resolveOriginTarget?.({
+    const target = await telegramApprovalCapability.native?.resolveOriginTarget?.({
       cfg: {
         ...buildConfig(),
         session: { store: STORE_PATH },
@@ -186,7 +188,7 @@ describe("telegram native approval adapter", () => {
   });
 
   it("marks DM-only telegram approvals to notify the origin chat after delivery", () => {
-    const capabilities = telegramNativeApprovalAdapter.native?.describeDeliveryCapabilities({
+    const capabilities = telegramApprovalCapability.native?.describeDeliveryCapabilities({
       cfg: buildConfig(),
       accountId: "default",
       approvalKind: "exec",

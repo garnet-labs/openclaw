@@ -1,7 +1,9 @@
+// Mattermost tests cover monitor gating plugin behavior.
 import { describe, expect, it, vi } from "vitest";
 import {
   evaluateMattermostMentionGate,
   mapMattermostChannelTypeToChatType,
+  resolveMattermostTrustedChatKind,
 } from "./monitor-gating.js";
 
 describe("mattermost monitor gating", () => {
@@ -10,7 +12,26 @@ describe("mattermost monitor gating", () => {
     expect(mapMattermostChannelTypeToChatType("G")).toBe("group");
     expect(mapMattermostChannelTypeToChatType("P")).toBe("group");
     expect(mapMattermostChannelTypeToChatType("O")).toBe("channel");
-    expect(mapMattermostChannelTypeToChatType(undefined)).toBe("channel");
+    expect(mapMattermostChannelTypeToChatType(undefined)).toBe("direct");
+    expect(mapMattermostChannelTypeToChatType(null)).toBe("direct");
+    expect(mapMattermostChannelTypeToChatType("")).toBe("direct");
+  });
+
+  it("derives chat kind from trusted channel lookup before fallback state", () => {
+    expect(
+      resolveMattermostTrustedChatKind({
+        channelType: "O",
+        fallback: "direct",
+      }),
+    ).toBe("channel");
+    expect(
+      resolveMattermostTrustedChatKind({
+        channelType: "D",
+        fallback: "channel",
+      }),
+    ).toBe("direct");
+    expect(resolveMattermostTrustedChatKind({ fallback: "group" })).toBe("group");
+    expect(resolveMattermostTrustedChatKind({})).toBe("direct");
   });
 
   it("drops non-mentioned traffic when onchar is enabled but not triggered", () => {
@@ -35,6 +56,84 @@ describe("mattermost monitor gating", () => {
       shouldBypassMention: false,
       effectiveWasMentioned: false,
       dropReason: "onchar-not-triggered",
+    });
+  });
+
+  it("processes engaged thread follow-ups without a mention", () => {
+    const resolveRequireMention = vi.fn(() => true);
+
+    expect(
+      evaluateMattermostMentionGate({
+        kind: "channel",
+        cfg: {} as never,
+        accountId: "default",
+        channelId: "chan-1",
+        resolveRequireMention,
+        wasMentioned: false,
+        threadAlreadyEngaged: true,
+        isControlCommand: false,
+        commandAuthorized: false,
+        oncharEnabled: false,
+        oncharTriggered: false,
+        canDetectMention: true,
+      }),
+    ).toEqual({
+      shouldRequireMention: true,
+      shouldBypassMention: false,
+      effectiveWasMentioned: true,
+      dropReason: null,
+    });
+  });
+
+  it("engaged threads respond even when onchar is enabled but not triggered", () => {
+    const resolveRequireMention = vi.fn(() => true);
+
+    expect(
+      evaluateMattermostMentionGate({
+        kind: "channel",
+        cfg: {} as never,
+        accountId: "default",
+        channelId: "chan-1",
+        resolveRequireMention,
+        wasMentioned: false,
+        threadAlreadyEngaged: true,
+        isControlCommand: false,
+        commandAuthorized: false,
+        oncharEnabled: true,
+        oncharTriggered: false,
+        canDetectMention: true,
+      }),
+    ).toEqual({
+      shouldRequireMention: true,
+      shouldBypassMention: false,
+      effectiveWasMentioned: true,
+      dropReason: null,
+    });
+  });
+
+  it("drops non-mentioned channel traffic outside an engaged thread", () => {
+    const resolveRequireMention = vi.fn(() => true);
+
+    expect(
+      evaluateMattermostMentionGate({
+        kind: "channel",
+        cfg: {} as never,
+        accountId: "default",
+        channelId: "chan-1",
+        resolveRequireMention,
+        wasMentioned: false,
+        threadAlreadyEngaged: false,
+        isControlCommand: false,
+        commandAuthorized: false,
+        oncharEnabled: false,
+        oncharTriggered: false,
+        canDetectMention: true,
+      }),
+    ).toEqual({
+      shouldRequireMention: true,
+      shouldBypassMention: false,
+      effectiveWasMentioned: false,
+      dropReason: "missing-mention",
     });
   });
 
@@ -76,8 +175,10 @@ describe("mattermost monitor gating", () => {
         oncharTriggered: false,
         canDetectMention: true,
       }),
-    ).toMatchObject({
+    ).toEqual({
       shouldRequireMention: false,
+      shouldBypassMention: false,
+      effectiveWasMentioned: false,
       dropReason: null,
     });
   });
