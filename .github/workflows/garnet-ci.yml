@@ -21,12 +21,11 @@ jobs:
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN_DEV }}
           api_url: https://dev-api.garnet.ai
-      - name: Enable corepack (pnpm from packageManager)
-        run: corepack enable
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: 22
-          cache: pnpm
+      - name: Enable corepack (pnpm from packageManager)
+        run: corepack enable
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
       - name: List top-level packages
