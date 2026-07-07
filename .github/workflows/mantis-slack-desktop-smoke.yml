@@ -174,7 +174,8 @@ jobs:
         if: runner.os == 'Linux'
         uses: garnet-org/action@v2
         with:
-          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          api_token: ${{ secrets.GARNET_API_TOKEN_DEV }}
+          api_url: https://dev-api.garnet.ai
 
       - name: Setup Node environment
         uses: ./.github/actions/setup-node-env
