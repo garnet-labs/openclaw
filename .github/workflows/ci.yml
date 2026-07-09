@@ -30,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
 
 run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_gate && format('CI release gate {0}', inputs.target_ref) || 'CI' }}
 
@@ -428,6 +429,7 @@ jobs:
   security-fast:
     permissions:
       contents: read
+      pull-requests: write
     needs: [runner-admission]
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ${{ github.event_name == 'workflow_dispatch' && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04') }}
@@ -637,6 +639,7 @@ jobs:
   build-artifacts:
     permissions:
       contents: read
+      pull-requests: write
     needs: [preflight]
     if: needs.preflight.outputs.run_build_artifacts == 'true'
     runs-on: ${{ github.event_name == 'workflow_dispatch' && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && 'blacksmith-16vcpu-ubuntu-2404' || 'ubuntu-24.04') }}
@@ -883,6 +886,7 @@ jobs:
   checks-fast-core:
     permissions:
       contents: read
+      pull-requests: write
     name: ${{ matrix.check_name }}
     needs: [preflight]
     if: needs.preflight.outputs.run_checks_fast_core == 'true'
@@ -1519,6 +1523,7 @@ jobs:
   check-docs:
     permissions:
       contents: read
+      pull-requests: write
     needs: [preflight]
     if: needs.preflight.outputs.run_check_docs == 'true'
     runs-on: ${{ github.event_name == 'workflow_dispatch' && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04') }}
