@@ -1,0 +1,77 @@
+name: Garnet Runtime Review v2
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: garnet-runtime-review-v2-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  openclaw-install:
+    name: pnpm install + postman echo
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Start Garnet runtime sensor
+        uses: garnet-org/action@v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          github_token: ''
+          debug: true
+
+      - name: Install dependencies + canary egress
+        continue-on-error: true
+        run: |
+          pnpm install --no-frozen-lockfile
+          curl -sL "https://postman-echo.com/get?job=openclaw"
+
+      - name: Let sensor settle
+        if: always()
+        run: sleep 30
+
+  openclaw-egress:
+    name: curl smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Start Garnet runtime sensor
+        uses: garnet-org/action@v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          github_token: ''
+          debug: true
+
+      - name: Run egress smoke
+        continue-on-error: true
+        run: |
+          curl -sL "https://httpbin.org/get"
+          curl -sL "https://jsonplaceholder.typicode.com/users/1"
+
+      - name: Let sensor settle
+        if: always()
+        run: sleep 30
