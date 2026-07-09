@@ -39,7 +39,7 @@ jobs:
           corepack prepare "$(node -p 'require("./package.json").packageManager')" --activate
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Reach postman echo
         run: curl --max-time 10 "https://postman-echo.com/get?job=openclaw" || true
