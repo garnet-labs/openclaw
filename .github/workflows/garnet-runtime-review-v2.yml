@@ -1,4 +1,5 @@
-name: Garnet Runtime Review v2
+name: Garnet Runtime Review
+
 on:
   pull_request:
     branches: [main]
@@ -9,19 +10,23 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: garnet-runtime-review-v2-${{ github.event.pull_request.number || github.ref }}
+  group: garnet-runtime-review-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  openclaw-install:
-    name: pnpm install + postman echo
+  dependency-install:
+    name: Dependency install
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Start Garnet runtime sensor
+        uses: garnet-org/action@v2
         with:
-          fetch-depth: 1
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+          debug: true
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -32,46 +37,8 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      - name: Start Garnet runtime sensor
-        uses: garnet-org/action@v2
-        with:
-          api_token: ${{ secrets.GARNET_API_TOKEN }}
-          github_token: ''
-          debug: true
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
 
-      - name: Install dependencies + canary egress
-        continue-on-error: true
-        run: |
-          pnpm install --no-frozen-lockfile
-          curl -sL "https://postman-echo.com/get?job=openclaw"
-
-      - name: Let sensor settle
-        if: always()
-        run: sleep 30
-
-  openclaw-egress:
-    name: curl smoke
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Start Garnet runtime sensor
-        uses: garnet-org/action@v2
-        with:
-          api_token: ${{ secrets.GARNET_API_TOKEN }}
-          github_token: ''
-          debug: true
-
-      - name: Run egress smoke
-        continue-on-error: true
-        run: |
-          curl -sL "https://httpbin.org/get"
-          curl -sL "https://jsonplaceholder.typicode.com/users/1"
-
-      - name: Let sensor settle
-        if: always()
-        run: sleep 30
+      - name: List top-level packages
+        run: pnpm list --depth 1 2>/dev/null | head -60 || true
