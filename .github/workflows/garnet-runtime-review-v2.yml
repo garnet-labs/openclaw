@@ -26,7 +26,6 @@ jobs:
         uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
-          debug: true
 
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -40,6 +39,3 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      - name: Reach postman echo
-        run: curl --max-time 10 "https://postman-echo.com/get?job=openclaw" || true
