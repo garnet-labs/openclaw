@@ -1,38 +1,23 @@
 name: Garnet Runtime Visibility — openclaw
-
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
-  pull-requests: write
-
 jobs:
   dep-install:
     name: Dependency Install
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
+      - uses: actions/checkout@v4
       - name: Garnet Runtime Visibility
-        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
+        uses: garnet-org/action@v2
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
-
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 24
-
-      - name: Prepare pnpm from packageManager
-        run: |
-          corepack enable
-          corepack prepare "$(node -p 'require("./package.json").packageManager')" --activate
-
+          node-version: 22
+          cache: pnpm
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
+        run: pnpm install --no-frozen-lockfile
       - name: List top-level packages
         run: pnpm list --depth 1 2>/dev/null | head -60 || true
