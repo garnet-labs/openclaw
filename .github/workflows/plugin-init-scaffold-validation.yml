@@ -55,3 +55,6 @@ jobs:
 
       - name: Generate and validate provider scaffold
         run: pnpm test:plugins:init-provider-scaffold
+
+
+# Garnet App smoke test #2 — 2026-07-08 (fork-only, dev control plane)
