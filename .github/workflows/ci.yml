@@ -30,7 +30,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_gate && format('CI release gate {0}', inputs.target_ref) || 'CI' }}
 
