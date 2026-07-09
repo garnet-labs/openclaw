@@ -29,7 +29,7 @@ jobs:
       - name: Prepare pnpm from packageManager
         run: |
           corepack enable
-          corepack prepare "$(node -p 'require("./package.json").packageManager.split("+").shift()')" --activate
+          corepack prepare "$(node -p 'require("./package.json").packageManager')" --activate
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
