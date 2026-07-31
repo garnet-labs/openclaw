@@ -470,6 +470,9 @@ def render_markdown(
             "<!-- garnet-review-sticky -->",
             f"# Garnet review: PR {context['number']}",
             "",
+            f"**Final verdict: {'FLAG' if 'FLAG' in {correctness['verdict'], behavior['verdict']} else ('needs-human' if 'needs-human' in {correctness['verdict'], behavior['verdict']} else 'PASS')}** "
+            f"(correctness {correctness.get('verdict', 'unknown')} · behavior {behavior.get('verdict', 'unknown')})",
+            "",
             "This deterministic gate compares GitHub correctness signals with Runtime Review behavior deltas.",
             "",
             "| View | Verdict | Signals |",
