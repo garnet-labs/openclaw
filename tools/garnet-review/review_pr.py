@@ -246,6 +246,17 @@ def baseline_evidence(repo: str, value: str) -> dict[str, Any]:
     return {"present": False, "reason": "Baseline must be a PR number or run_id:profile_id."}
 
 
+def configured_baseline(explicit: str) -> str:
+    if explicit:
+        return explicit
+    config_path = ROOT / "tools/garnet-review/baseline.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, ValueError):
+        return ""
+    return str(config.get("baseline", "")).strip()
+
+
 def behavior_view(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
     if not current.get("present") or not baseline.get("present"):
         return {
@@ -326,7 +337,7 @@ def main() -> int:
     args = parser.parse_args()
     context = pr_context(args.repo, args.pr_number)
     runtime = runtime_evidence(args.repo, args.pr_number, context["head_sha"])
-    baseline = baseline_evidence(args.repo, args.baseline)
+    baseline = baseline_evidence(args.repo, configured_baseline(args.baseline))
     correctness = check_rollup(args.repo, context["head_sha"])
     behavior = behavior_view(runtime, baseline)
     result = {
