@@ -597,7 +597,10 @@ jobs:
             eventName !== "pull_request" ||
             typeof changedNodeTestPlan.hasPromptSnapshotAffectingChange !== "function" ||
             changedNodeTestPlan.hasPromptSnapshotAffectingChange(changedPaths);
-          const runBuildArtifacts = runNodeFull && changedScopeHasBuildImpact;
+          const runBuildArtifacts =
+            runNodeFull &&
+            (changedScopeHasBuildImpact ||
+              (eventName === "pull_request" && !isCanonicalRepository));
           const runQaSmokeCi =
             runNodeFull &&
             changedScopeHasQaImpact &&

@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -110,19 +111,11 @@ def parse_public_profile_urls(body: str) -> list[tuple[str, str, str]]:
     ]
 
 
-def runtime_evidence(repo: str, number: int, head_sha: str) -> dict[str, Any]:
-    comments = gh(f"repos/{repo}/issues/{number}/comments")
-    if isinstance(comments, dict):
-        comments = [comments]
-    candidates = [
-        item
-        for item in comments
-        if RUNTIME_MARKER in (item.get("body") or "")
-        and re.search(rf"<!-- garnet:commit {re.escape(head_sha)} -->", item.get("body") or "")
-    ]
-    if not candidates:
-        return {"present": False, "reason": "No head-pinned Garnet Runtime Review comment was found."}
-    body = candidates[-1]["body"]
+def _profile_evidence_from_comment(
+    body: str,
+    comment: dict[str, Any],
+    pinned_commit: str,
+) -> dict[str, Any]:
     parsed_profiles = parse_public_profile_urls(body)
     profiles: list[dict[str, Any]] = []
     for run_id, profile_id, profile_url in parsed_profiles:
@@ -147,14 +140,65 @@ def runtime_evidence(repo: str, number: int, head_sha: str) -> dict[str, Any]:
     )
     return {
         "present": True,
-        "commit": head_sha,
-        "comment_url": candidates[-1].get("html_url", ""),
+        "commit": pinned_commit,
+        "comment_url": comment.get("html_url", ""),
         "markers": re.findall(r"<!--\s*(garnet[^>]+)-->", body),
         "profile": profiles[0]["data"] if profiles and "data" in profiles[0] else {},
         "profiles": profiles,
         "destinations": destinations,
         "processes": processes,
     }
+
+
+def runtime_evidence(repo: str, number: int, head_sha: str) -> dict[str, Any]:
+    comments = gh(f"repos/{repo}/issues/{number}/comments")
+    if isinstance(comments, dict):
+        comments = [comments]
+    candidates = [
+        item
+        for item in comments
+        if RUNTIME_MARKER in (item.get("body") or "")
+        and re.search(rf"<!-- garnet:commit {re.escape(head_sha)} -->", item.get("body") or "")
+    ]
+    if not candidates:
+        return {"present": False, "reason": "No head-pinned Garnet Runtime Review comment was found."}
+    body = candidates[-1].get("body") or ""
+    return _profile_evidence_from_comment(body, candidates[-1], head_sha)
+
+
+def latest_runtime_evidence(repo: str, number: int) -> dict[str, Any]:
+    """Read the latest baseline review, even if the PR moved afterward."""
+    comments = gh(f"repos/{repo}/issues/{number}/comments")
+    if isinstance(comments, dict):
+        comments = [comments]
+    candidates: list[tuple[dict[str, Any], str]] = []
+    for comment in comments:
+        body = comment.get("body") or ""
+        if RUNTIME_MARKER not in body:
+            continue
+        match = re.search(r"<!-- garnet:commit ([0-9a-fA-F]{40}) -->", body)
+        if match:
+            candidates.append((comment, match.group(1)))
+    if not candidates:
+        return {"present": False, "reason": "No Garnet Runtime Review comment was found on the baseline PR."}
+    comment, pinned_commit = candidates[-1]
+    return _profile_evidence_from_comment(comment.get("body") or "", comment, pinned_commit)
+
+
+def wait_for_runtime_evidence(
+    repo: str,
+    number: int,
+    head_sha: str,
+    *,
+    timeout_seconds: int = 15 * 60,
+    interval_seconds: int = 30,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    evidence = runtime_evidence(repo, number, head_sha)
+    while not evidence.get("present") and time.monotonic() < deadline:
+        time.sleep(min(interval_seconds, max(0, deadline - time.monotonic())))
+        evidence = runtime_evidence(repo, number, head_sha)
+    return evidence
 
 
 def bounded_diff(context: dict[str, Any]) -> tuple[str, int]:
@@ -227,8 +271,7 @@ def baseline_evidence(repo: str, value: str) -> dict[str, Any]:
     if not value:
         return {"present": False, "reason": "No --baseline PR or run/profile identifier was supplied."}
     if value.isdigit():
-        context = pr_context(repo, int(value))
-        return runtime_evidence(repo, int(value), context["head_sha"])
+        return latest_runtime_evidence(repo, int(value))
     match = re.fullmatch(r"(\d+):([0-9a-fA-F-]{36})", value)
     if match:
         run_id, profile_id = match.groups()
@@ -259,9 +302,14 @@ def configured_baseline(explicit: str) -> str:
 
 def behavior_view(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
     if not current.get("present") or not baseline.get("present"):
+        reasons = []
+        if not current.get("present"):
+            reasons.append(current.get("reason", "Current evidence missing."))
+        if not baseline.get("present"):
+            reasons.append(baseline.get("reason", "Baseline evidence missing."))
         return {
             "verdict": "needs-human",
-            "risks": [current.get("reason", "Current evidence missing."), baseline.get("reason", "Baseline evidence missing.")],
+            "risks": reasons,
             "evidence": [current.get("comment_url", ""), baseline.get("comment_url", "")],
             "behaviorVsBaseline": "Unable to compare because one or both Runtime Review profiles are missing.",
             "deltas": [],
@@ -323,6 +371,7 @@ def render_markdown(
             f"- Current Runtime Review comment: {current.get('comment_url', 'not found')}",
             f"- Current public profile: {current.get('profiles', [{}])[0].get('url', 'not found')}",
             f"- Baseline Runtime Review comment: {baseline.get('comment_url', 'not found')}",
+            f"- Baseline commit: {baseline.get('commit', 'not found')} (from Runtime Review pin)",
             f"- Baseline public profile: {baseline.get('profiles', [{}])[0].get('url', 'not found')}",
         ]
     ) + "\n"
@@ -336,7 +385,7 @@ def main() -> int:
     parser.add_argument("--output-json", required=True)
     args = parser.parse_args()
     context = pr_context(args.repo, args.pr_number)
-    runtime = runtime_evidence(args.repo, args.pr_number, context["head_sha"])
+    runtime = wait_for_runtime_evidence(args.repo, args.pr_number, context["head_sha"])
     baseline = baseline_evidence(args.repo, configured_baseline(args.baseline))
     correctness = check_rollup(args.repo, context["head_sha"])
     behavior = behavior_view(runtime, baseline)
