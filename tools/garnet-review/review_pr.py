@@ -8,14 +8,6 @@ View A rolls up GitHub check runs for the PR head. View B compares the
 head-pinned Garnet Runtime Review profiles with a baseline supplied as a PR
 number or ``run_id:profile_id``. The workflow passes ``GARNET_BASELINE_PR``
 through ``--baseline``; without it, missing baseline evidence is needs-human.
-
-Runtime deltas are classified rather than discarded. Process lineages under
-``Runner.Worker > bash``/``sh`` are workload; hosted-compute, provjobd,
-Runner.Listener, terminal Runner.Worker, and systemd-network lineages are
-runner infrastructure. Destinations in GitHub/Actions artifact ranges are
-runner infrastructure unless profile associations link them to a workload
-process. Flat destination sets without that linkage use the destination-only
-classification and are identified as such in the rendered fold.
 """
 
 from __future__ import annotations
@@ -27,7 +19,6 @@ import os
 import re
 import subprocess
 import sys
-import time
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -39,16 +30,6 @@ POLICY_HEADING = "## ClawSweeper Review Policy"
 PATCH_CHAR_CAP = 4_000
 DIFF_CHAR_CAP = 60_000
 PROFILE_CHAR_CAP = 20_000
-RUNNER_INFRA_PROCESS_MARKERS = (
-    "hosted-compute",
-    "provjobd",
-    "Runner.Listener",
-    "systemd-network",
-)
-RUNNER_INFRA_DESTINATION_SUFFIXES = (
-    ".blob.core.windows.net",
-    ".actions.githubusercontent.com",
-)
 PUBLIC_PROFILE_RE = re.compile(
     r"https://app\.garnet\.ai/public/runs/(?P<run_id>\d+)"
     r"\?profile=(?P<profile_id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -129,11 +110,19 @@ def parse_public_profile_urls(body: str) -> list[tuple[str, str, str]]:
     ]
 
 
-def _profile_evidence_from_comment(
-    body: str,
-    comment: dict[str, Any],
-    pinned_commit: str,
-) -> dict[str, Any]:
+def runtime_evidence(repo: str, number: int, head_sha: str) -> dict[str, Any]:
+    comments = gh(f"repos/{repo}/issues/{number}/comments")
+    if isinstance(comments, dict):
+        comments = [comments]
+    candidates = [
+        item
+        for item in comments
+        if RUNTIME_MARKER in (item.get("body") or "")
+        and re.search(rf"<!-- garnet:commit {re.escape(head_sha)} -->", item.get("body") or "")
+    ]
+    if not candidates:
+        return {"present": False, "reason": "No head-pinned Garnet Runtime Review comment was found."}
+    body = candidates[-1]["body"]
     parsed_profiles = parse_public_profile_urls(body)
     profiles: list[dict[str, Any]] = []
     for run_id, profile_id, profile_url in parsed_profiles:
@@ -158,65 +147,14 @@ def _profile_evidence_from_comment(
     )
     return {
         "present": True,
-        "commit": pinned_commit,
-        "comment_url": comment.get("html_url", ""),
+        "commit": head_sha,
+        "comment_url": candidates[-1].get("html_url", ""),
         "markers": re.findall(r"<!--\s*(garnet[^>]+)-->", body),
         "profile": profiles[0]["data"] if profiles and "data" in profiles[0] else {},
         "profiles": profiles,
         "destinations": destinations,
         "processes": processes,
     }
-
-
-def runtime_evidence(repo: str, number: int, head_sha: str) -> dict[str, Any]:
-    comments = gh(f"repos/{repo}/issues/{number}/comments")
-    if isinstance(comments, dict):
-        comments = [comments]
-    candidates = [
-        item
-        for item in comments
-        if RUNTIME_MARKER in (item.get("body") or "")
-        and re.search(rf"<!-- garnet:commit {re.escape(head_sha)} -->", item.get("body") or "")
-    ]
-    if not candidates:
-        return {"present": False, "reason": "No head-pinned Garnet Runtime Review comment was found."}
-    body = candidates[-1].get("body") or ""
-    return _profile_evidence_from_comment(body, candidates[-1], head_sha)
-
-
-def latest_runtime_evidence(repo: str, number: int) -> dict[str, Any]:
-    """Read the latest baseline review, even if the PR moved afterward."""
-    comments = gh(f"repos/{repo}/issues/{number}/comments")
-    if isinstance(comments, dict):
-        comments = [comments]
-    candidates: list[tuple[dict[str, Any], str]] = []
-    for comment in comments:
-        body = comment.get("body") or ""
-        if RUNTIME_MARKER not in body:
-            continue
-        match = re.search(r"<!-- garnet:commit ([0-9a-fA-F]{40}) -->", body)
-        if match:
-            candidates.append((comment, match.group(1)))
-    if not candidates:
-        return {"present": False, "reason": "No Garnet Runtime Review comment was found on the baseline PR."}
-    comment, pinned_commit = candidates[-1]
-    return _profile_evidence_from_comment(comment.get("body") or "", comment, pinned_commit)
-
-
-def wait_for_runtime_evidence(
-    repo: str,
-    number: int,
-    head_sha: str,
-    *,
-    timeout_seconds: int = 15 * 60,
-    interval_seconds: int = 30,
-) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout_seconds
-    evidence = runtime_evidence(repo, number, head_sha)
-    while not evidence.get("present") and time.monotonic() < deadline:
-        time.sleep(min(interval_seconds, max(0, deadline - time.monotonic())))
-        evidence = runtime_evidence(repo, number, head_sha)
-    return evidence
 
 
 def bounded_diff(context: dict[str, Any]) -> tuple[str, int]:
@@ -261,32 +199,8 @@ def check_rollup(repo: str, sha: str) -> dict[str, Any]:
     }
 
 
-def is_workload_process(lineage: str) -> bool:
-    return bool(re.search(r"Runner\.Worker > (?:bash|sh)(?: >|$)", lineage))
-
-
-def is_runner_infra_process(lineage: str) -> bool:
-    if is_workload_process(lineage):
-        return False
-    if any(marker.lower() in lineage.lower() for marker in RUNNER_INFRA_PROCESS_MARKERS):
-        return True
-    # A process outside the Runner.Worker job-step shell chain is not
-    # attributable to workload execution from this profile shape.
-    return True
-
-
-def is_runner_infra_destination(destination: str) -> bool:
-    normalized = destination.lower().rstrip(".")
-    if normalized == "ip6-allrouters" or normalized.startswith(("169.254.", "fe80:")):
-        return True
-    if normalized.endswith(RUNNER_INFRA_DESTINATION_SUFFIXES):
-        return True
-    match = re.fullmatch(r"140\.82\.(?:\d{1,3})\.(?:\d{1,3})", normalized)
-    return bool(match)
-
-
-def profile_sets(evidence: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    jobs: dict[str, dict[str, Any]] = {}
+def profile_sets(evidence: dict[str, Any]) -> dict[str, dict[str, set[str]]]:
+    jobs: dict[str, dict[str, set[str]]] = {}
     for entry in evidence.get("profiles", []):
         data = entry.get("data", {})
         documents = data.get("profiles", []) if isinstance(data, dict) else []
@@ -295,31 +209,17 @@ def profile_sets(evidence: dict[str, Any]) -> dict[str, dict[str, Any]]:
         for document in documents:
             run = document.get("run", {}) if isinstance(document, dict) else {}
             job = run.get("job", "unknown")
-            bucket = jobs.setdefault(
-                job,
-                {
-                    "processes": set(),
-                    "destinations": set(),
-                    "destination_processes": {},
-                },
-            )
+            bucket = jobs.setdefault(job, {"processes": set(), "destinations": set()})
             for association in document.get("associations", []):
                 ancestry = association.get("ancestry") or []
                 process = association.get("process")
-                lineage = ""
                 if process:
-                    lineage = " > ".join([*ancestry, process]) if ancestry else process
-                    bucket["processes"].add(lineage)
+                    bucket["processes"].add(" > ".join([*ancestry, process]) if ancestry else process)
                 names = association.get("remote_names") or []
-                destinations = names or (
-                    [association["remote_address"]]
-                    if association.get("remote_address")
-                    else []
-                )
-                for destination in destinations:
-                    bucket["destinations"].add(destination)
-                    if lineage:
-                        bucket["destination_processes"].setdefault(destination, set()).add(lineage)
+                if names:
+                    bucket["destinations"].update(names)
+                elif association.get("remote_address"):
+                    bucket["destinations"].add(association["remote_address"])
     return jobs
 
 
@@ -327,7 +227,8 @@ def baseline_evidence(repo: str, value: str) -> dict[str, Any]:
     if not value:
         return {"present": False, "reason": "No --baseline PR or run/profile identifier was supplied."}
     if value.isdigit():
-        return latest_runtime_evidence(repo, int(value))
+        context = pr_context(repo, int(value))
+        return runtime_evidence(repo, int(value), context["head_sha"])
     match = re.fullmatch(r"(\d+):([0-9a-fA-F-]{36})", value)
     if match:
         run_id, profile_id = match.groups()
@@ -358,14 +259,9 @@ def configured_baseline(explicit: str) -> str:
 
 def behavior_view(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
     if not current.get("present") or not baseline.get("present"):
-        reasons = []
-        if not current.get("present"):
-            reasons.append(current.get("reason", "Current evidence missing."))
-        if not baseline.get("present"):
-            reasons.append(baseline.get("reason", "Baseline evidence missing."))
         return {
             "verdict": "needs-human",
-            "risks": reasons,
+            "risks": [current.get("reason", "Current evidence missing."), baseline.get("reason", "Baseline evidence missing.")],
             "evidence": [current.get("comment_url", ""), baseline.get("comment_url", "")],
             "behaviorVsBaseline": "Unable to compare because one or both Runtime Review profiles are missing.",
             "deltas": [],
@@ -374,71 +270,17 @@ def behavior_view(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str
     baseline_jobs = profile_sets(baseline)
     deltas: list[dict[str, Any]] = []
     for job, observed in current_jobs.items():
-        base = baseline_jobs.get(
-            job,
-            {"processes": set(), "destinations": set(), "destination_processes": {}},
-        )
+        base = baseline_jobs.get(job, {"processes": set(), "destinations": set()})
         processes = sorted(observed["processes"] - base["processes"])
         destinations = sorted(observed["destinations"] - base["destinations"])
-        workload_processes = sorted(filter(is_workload_process, processes))
-        runner_infra_processes = sorted(
-            process for process in processes if is_runner_infra_process(process)
-        )
-        workload_destinations: list[str] = []
-        runner_infra_destinations: list[str] = []
-        flat_destination_classification = False
-        for destination in destinations:
-            linked_processes = observed["destination_processes"].get(destination, set())
-            if linked_processes:
-                if any(is_workload_process(process) for process in linked_processes):
-                    workload_destinations.append(destination)
-                else:
-                    runner_infra_destinations.append(destination)
-            elif is_runner_infra_destination(destination):
-                runner_infra_destinations.append(destination)
-                flat_destination_classification = True
-            else:
-                workload_destinations.append(destination)
-                flat_destination_classification = True
         if processes or destinations:
-            deltas.append(
-                {
-                    "job": job,
-                    "workload": {
-                        "newProcesses": workload_processes,
-                        "newDestinations": sorted(workload_destinations),
-                    },
-                    "runnerInfra": {
-                        "newProcesses": runner_infra_processes,
-                        "newDestinations": sorted(runner_infra_destinations),
-                    },
-                    "destinationClassification": (
-                        "association-linked where available; flat destination "
-                        "sets use destination-only rules"
-                        if flat_destination_classification
-                        else "association-linked"
-                    ),
-                }
-            )
-    workload_deltas = [
-        item
-        for item in deltas
-        if item["workload"]["newProcesses"] or item["workload"]["newDestinations"]
-    ]
-    verdict = "PASS" if not workload_deltas else "FLAG"
+            deltas.append({"job": job, "newProcesses": processes, "newDestinations": destinations})
+    verdict = "PASS" if not deltas else "FLAG"
     return {
         "verdict": verdict,
-        "risks": [
-            f"{item['job']}: workload processes={item['workload']['newProcesses']}, "
-            f"workload destinations={item['workload']['newDestinations']}"
-            for item in workload_deltas
-        ],
+        "risks": [f"{item['job']}: new processes={item['newProcesses']}, new destinations={item['newDestinations']}" for item in deltas],
         "evidence": [current.get("comment_url", ""), baseline.get("comment_url", "")],
-        "behaviorVsBaseline": (
-            "No new workload processes or destinations versus baseline."
-            if not workload_deltas
-            else "Observed workload deltas versus baseline are listed explicitly."
-        ),
+        "behaviorVsBaseline": "No new processes or destinations versus baseline." if not deltas else "Observed runtime deltas versus baseline are listed explicitly.",
         "deltas": deltas,
     }
 
@@ -459,19 +301,10 @@ def render_markdown(
             return "<br>".join(compact(json.dumps(entry) if isinstance(entry, dict) else entry) for entry in item) or "—"
         return compact(item) or "—"
 
-    def first_profile_url(evidence: dict[str, Any]) -> str:
-        profiles = evidence.get("profiles") or []
-        if not profiles:
-            return "not found"
-        return str(profiles[0].get("url") or "not found")
-
     return "\n".join(
         [
             "<!-- garnet-review-sticky -->",
             f"# Garnet review: PR {context['number']}",
-            "",
-            f"**Final verdict: {'FLAG' if 'FLAG' in {correctness['verdict'], behavior['verdict']} else ('needs-human' if 'needs-human' in {correctness['verdict'], behavior['verdict']} else 'PASS')}** "
-            f"(correctness {correctness.get('verdict', 'unknown')} · behavior {behavior.get('verdict', 'unknown')})",
             "",
             "This deterministic gate compares GitHub correctness signals with Runtime Review behavior deltas.",
             "",
@@ -482,36 +315,15 @@ def render_markdown(
             "",
             "## Behavior deltas",
             "",
-            *[
-                f"- `{item['job']}`: workload processes={item['workload']['newProcesses']}; "
-                f"workload destinations={item['workload']['newDestinations']}"
-                for item in behavior.get("deltas", [])
-                if item["workload"]["newProcesses"] or item["workload"]["newDestinations"]
-            ],
+            *[f"- `{item['job']}`: new processes={item['newProcesses']}; new destinations={item['newDestinations']}" for item in behavior.get("deltas", [])],
             f"- {compact(behavior.get('behaviorVsBaseline', 'No comparison supplied.'))}",
-            "",
-            "<details>",
-            "<summary>Runner infrastructure deltas (classified, not hidden)</summary>",
-            "",
-            "Runner infrastructure includes hosted-compute/provjobd/Runner.Listener/terminal Runner.Worker/systemd-network lineages and GitHub/Actions artifact destinations. Destination-only classification is used when profile associations do not link a destination to a process.",
-            "",
-            *[
-                f"- `{item['job']}`: processes={item['runnerInfra']['newProcesses']}; "
-                f"destinations={item['runnerInfra']['newDestinations']} "
-                f"({item['destinationClassification']})"
-                for item in behavior.get("deltas", [])
-                if item["runnerInfra"]["newProcesses"] or item["runnerInfra"]["newDestinations"]
-            ],
-            "",
-            "</details>",
             "",
             "## Runtime profile citations",
             "",
             f"- Current Runtime Review comment: {current.get('comment_url', 'not found')}",
-            f"- Current public profile: {first_profile_url(current)}",
+            f"- Current public profile: {current.get('profiles', [{}])[0].get('url', 'not found')}",
             f"- Baseline Runtime Review comment: {baseline.get('comment_url', 'not found')}",
-            f"- Baseline commit: {baseline.get('commit', 'not found')} (from Runtime Review pin)",
-            f"- Baseline public profile: {first_profile_url(baseline)}",
+            f"- Baseline public profile: {baseline.get('profiles', [{}])[0].get('url', 'not found')}",
         ]
     ) + "\n"
 
@@ -524,7 +336,7 @@ def main() -> int:
     parser.add_argument("--output-json", required=True)
     args = parser.parse_args()
     context = pr_context(args.repo, args.pr_number)
-    runtime = wait_for_runtime_evidence(args.repo, args.pr_number, context["head_sha"])
+    runtime = runtime_evidence(args.repo, args.pr_number, context["head_sha"])
     baseline = baseline_evidence(args.repo, configured_baseline(args.baseline))
     correctness = check_rollup(args.repo, context["head_sha"])
     behavior = behavior_view(runtime, baseline)
