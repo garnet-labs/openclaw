@@ -8,14 +8,6 @@ View A rolls up GitHub check runs for the PR head. View B compares the
 head-pinned Garnet Runtime Review profiles with a baseline supplied as a PR
 number or ``run_id:profile_id``. The workflow passes ``GARNET_BASELINE_PR``
 through ``--baseline``; without it, missing baseline evidence is needs-human.
-
-Runtime deltas are classified rather than discarded. Process lineages under
-``Runner.Worker > bash``/``sh`` are workload; hosted-compute, provjobd,
-Runner.Listener, terminal Runner.Worker, and systemd-network lineages are
-runner infrastructure. Destinations in GitHub/Actions artifact ranges are
-runner infrastructure unless profile associations link them to a workload
-process. Flat destination sets without that linkage use the destination-only
-classification and are identified as such in the rendered fold.
 """
 
 from __future__ import annotations
@@ -39,16 +31,6 @@ POLICY_HEADING = "## ClawSweeper Review Policy"
 PATCH_CHAR_CAP = 4_000
 DIFF_CHAR_CAP = 60_000
 PROFILE_CHAR_CAP = 20_000
-RUNNER_INFRA_PROCESS_MARKERS = (
-    "hosted-compute",
-    "provjobd",
-    "Runner.Listener",
-    "systemd-network",
-)
-RUNNER_INFRA_DESTINATION_SUFFIXES = (
-    ".blob.core.windows.net",
-    ".actions.githubusercontent.com",
-)
 PUBLIC_PROFILE_RE = re.compile(
     r"https://app\.garnet\.ai/public/runs/(?P<run_id>\d+)"
     r"\?profile=(?P<profile_id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -261,32 +243,8 @@ def check_rollup(repo: str, sha: str) -> dict[str, Any]:
     }
 
 
-def is_workload_process(lineage: str) -> bool:
-    return bool(re.search(r"Runner\.Worker > (?:bash|sh)(?: >|$)", lineage))
-
-
-def is_runner_infra_process(lineage: str) -> bool:
-    if is_workload_process(lineage):
-        return False
-    if any(marker.lower() in lineage.lower() for marker in RUNNER_INFRA_PROCESS_MARKERS):
-        return True
-    # A process outside the Runner.Worker job-step shell chain is not
-    # attributable to workload execution from this profile shape.
-    return True
-
-
-def is_runner_infra_destination(destination: str) -> bool:
-    normalized = destination.lower().rstrip(".")
-    if normalized == "ip6-allrouters" or normalized.startswith(("169.254.", "fe80:")):
-        return True
-    if normalized.endswith(RUNNER_INFRA_DESTINATION_SUFFIXES):
-        return True
-    match = re.fullmatch(r"140\.82\.(?:\d{1,3})\.(?:\d{1,3})", normalized)
-    return bool(match)
-
-
-def profile_sets(evidence: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    jobs: dict[str, dict[str, Any]] = {}
+def profile_sets(evidence: dict[str, Any]) -> dict[str, dict[str, set[str]]]:
+    jobs: dict[str, dict[str, set[str]]] = {}
     for entry in evidence.get("profiles", []):
         data = entry.get("data", {})
         documents = data.get("profiles", []) if isinstance(data, dict) else []
@@ -295,31 +253,17 @@ def profile_sets(evidence: dict[str, Any]) -> dict[str, dict[str, Any]]:
         for document in documents:
             run = document.get("run", {}) if isinstance(document, dict) else {}
             job = run.get("job", "unknown")
-            bucket = jobs.setdefault(
-                job,
-                {
-                    "processes": set(),
-                    "destinations": set(),
-                    "destination_processes": {},
-                },
-            )
+            bucket = jobs.setdefault(job, {"processes": set(), "destinations": set()})
             for association in document.get("associations", []):
                 ancestry = association.get("ancestry") or []
                 process = association.get("process")
-                lineage = ""
                 if process:
-                    lineage = " > ".join([*ancestry, process]) if ancestry else process
-                    bucket["processes"].add(lineage)
+                    bucket["processes"].add(" > ".join([*ancestry, process]) if ancestry else process)
                 names = association.get("remote_names") or []
-                destinations = names or (
-                    [association["remote_address"]]
-                    if association.get("remote_address")
-                    else []
-                )
-                for destination in destinations:
-                    bucket["destinations"].add(destination)
-                    if lineage:
-                        bucket["destination_processes"].setdefault(destination, set()).add(lineage)
+                if names:
+                    bucket["destinations"].update(names)
+                elif association.get("remote_address"):
+                    bucket["destinations"].add(association["remote_address"])
     return jobs
 
 
@@ -374,71 +318,17 @@ def behavior_view(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str
     baseline_jobs = profile_sets(baseline)
     deltas: list[dict[str, Any]] = []
     for job, observed in current_jobs.items():
-        base = baseline_jobs.get(
-            job,
-            {"processes": set(), "destinations": set(), "destination_processes": {}},
-        )
+        base = baseline_jobs.get(job, {"processes": set(), "destinations": set()})
         processes = sorted(observed["processes"] - base["processes"])
         destinations = sorted(observed["destinations"] - base["destinations"])
-        workload_processes = sorted(filter(is_workload_process, processes))
-        runner_infra_processes = sorted(
-            process for process in processes if is_runner_infra_process(process)
-        )
-        workload_destinations: list[str] = []
-        runner_infra_destinations: list[str] = []
-        flat_destination_classification = False
-        for destination in destinations:
-            linked_processes = observed["destination_processes"].get(destination, set())
-            if linked_processes:
-                if any(is_workload_process(process) for process in linked_processes):
-                    workload_destinations.append(destination)
-                else:
-                    runner_infra_destinations.append(destination)
-            elif is_runner_infra_destination(destination):
-                runner_infra_destinations.append(destination)
-                flat_destination_classification = True
-            else:
-                workload_destinations.append(destination)
-                flat_destination_classification = True
         if processes or destinations:
-            deltas.append(
-                {
-                    "job": job,
-                    "workload": {
-                        "newProcesses": workload_processes,
-                        "newDestinations": sorted(workload_destinations),
-                    },
-                    "runnerInfra": {
-                        "newProcesses": runner_infra_processes,
-                        "newDestinations": sorted(runner_infra_destinations),
-                    },
-                    "destinationClassification": (
-                        "association-linked where available; flat destination "
-                        "sets use destination-only rules"
-                        if flat_destination_classification
-                        else "association-linked"
-                    ),
-                }
-            )
-    workload_deltas = [
-        item
-        for item in deltas
-        if item["workload"]["newProcesses"] or item["workload"]["newDestinations"]
-    ]
-    verdict = "PASS" if not workload_deltas else "FLAG"
+            deltas.append({"job": job, "newProcesses": processes, "newDestinations": destinations})
+    verdict = "PASS" if not deltas else "FLAG"
     return {
         "verdict": verdict,
-        "risks": [
-            f"{item['job']}: workload processes={item['workload']['newProcesses']}, "
-            f"workload destinations={item['workload']['newDestinations']}"
-            for item in workload_deltas
-        ],
+        "risks": [f"{item['job']}: new processes={item['newProcesses']}, new destinations={item['newDestinations']}" for item in deltas],
         "evidence": [current.get("comment_url", ""), baseline.get("comment_url", "")],
-        "behaviorVsBaseline": (
-            "No new workload processes or destinations versus baseline."
-            if not workload_deltas
-            else "Observed workload deltas versus baseline are listed explicitly."
-        ),
+        "behaviorVsBaseline": "No new processes or destinations versus baseline." if not deltas else "Observed runtime deltas versus baseline are listed explicitly.",
         "deltas": deltas,
     }
 
@@ -470,9 +360,6 @@ def render_markdown(
             "<!-- garnet-review-sticky -->",
             f"# Garnet review: PR {context['number']}",
             "",
-            f"**Final verdict: {'FLAG' if 'FLAG' in {correctness['verdict'], behavior['verdict']} else ('needs-human' if 'needs-human' in {correctness['verdict'], behavior['verdict']} else 'PASS')}** "
-            f"(correctness {correctness.get('verdict', 'unknown')} · behavior {behavior.get('verdict', 'unknown')})",
-            "",
             "This deterministic gate compares GitHub correctness signals with Runtime Review behavior deltas.",
             "",
             "| View | Verdict | Signals |",
@@ -482,28 +369,8 @@ def render_markdown(
             "",
             "## Behavior deltas",
             "",
-            *[
-                f"- `{item['job']}`: workload processes={item['workload']['newProcesses']}; "
-                f"workload destinations={item['workload']['newDestinations']}"
-                for item in behavior.get("deltas", [])
-                if item["workload"]["newProcesses"] or item["workload"]["newDestinations"]
-            ],
+            *[f"- `{item['job']}`: new processes={item['newProcesses']}; new destinations={item['newDestinations']}" for item in behavior.get("deltas", [])],
             f"- {compact(behavior.get('behaviorVsBaseline', 'No comparison supplied.'))}",
-            "",
-            "<details>",
-            "<summary>Runner infrastructure deltas (classified, not hidden)</summary>",
-            "",
-            "Runner infrastructure includes hosted-compute/provjobd/Runner.Listener/terminal Runner.Worker/systemd-network lineages and GitHub/Actions artifact destinations. Destination-only classification is used when profile associations do not link a destination to a process.",
-            "",
-            *[
-                f"- `{item['job']}`: processes={item['runnerInfra']['newProcesses']}; "
-                f"destinations={item['runnerInfra']['newDestinations']} "
-                f"({item['destinationClassification']})"
-                for item in behavior.get("deltas", [])
-                if item["runnerInfra"]["newProcesses"] or item["runnerInfra"]["newDestinations"]
-            ],
-            "",
-            "</details>",
             "",
             "## Runtime profile citations",
             "",
