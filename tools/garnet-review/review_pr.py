@@ -349,6 +349,12 @@ def render_markdown(
             return "<br>".join(compact(json.dumps(entry) if isinstance(entry, dict) else entry) for entry in item) or "—"
         return compact(item) or "—"
 
+    def first_profile_url(evidence: dict[str, Any]) -> str:
+        profiles = evidence.get("profiles") or []
+        if not profiles:
+            return "not found"
+        return str(profiles[0].get("url") or "not found")
+
     return "\n".join(
         [
             "<!-- garnet-review-sticky -->",
@@ -369,10 +375,10 @@ def render_markdown(
             "## Runtime profile citations",
             "",
             f"- Current Runtime Review comment: {current.get('comment_url', 'not found')}",
-            f"- Current public profile: {current.get('profiles', [{}])[0].get('url', 'not found')}",
+            f"- Current public profile: {first_profile_url(current)}",
             f"- Baseline Runtime Review comment: {baseline.get('comment_url', 'not found')}",
             f"- Baseline commit: {baseline.get('commit', 'not found')} (from Runtime Review pin)",
-            f"- Baseline public profile: {baseline.get('profiles', [{}])[0].get('url', 'not found')}",
+            f"- Baseline public profile: {first_profile_url(baseline)}",
         ]
     ) + "\n"
 
