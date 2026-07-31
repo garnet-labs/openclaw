@@ -186,18 +186,14 @@ def call_anthropic(instruction: str) -> dict[str, Any]:
 
 
 def render_markdown(context: dict[str, Any], diff: dict[str, Any], evidence: dict[str, Any]) -> str:
-    def section(label: str, value: dict[str, Any]) -> list[str]:
-        lines = [f"## {label}", "", f"**Verdict:** `{value.get('verdict', 'unknown')}`", ""]
-        lines.append(value.get("summary", ""))
-        for key in ("risks", "reviewMetrics", "mergeRiskLabels", "bestSolution", "rankUpMoves", "evidence"):
-            item = value.get(key)
-            if not item:
-                continue
-            lines.extend(["", f"**{key}:**", ""])
-            lines.extend(f"- {json.dumps(entry) if isinstance(entry, dict) else entry}" for entry in (item if isinstance(item, list) else [item]))
-        if value.get("behaviorVsBaseline"):
-            lines.extend(["", f"**Behavior versus baseline:** {value['behaviorVsBaseline']}"])
-        return lines
+    def compact(value: Any) -> str:
+        return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+    def list_value(value: dict[str, Any], key: str) -> str:
+        item = value.get(key) or []
+        if isinstance(item, list):
+            return "<br>".join(compact(json.dumps(entry) if isinstance(entry, dict) else entry) for entry in item) or "—"
+        return compact(item) or "—"
 
     return "\n".join(
         [
@@ -206,15 +202,21 @@ def render_markdown(context: dict[str, Any], diff: dict[str, Any], evidence: dic
             "",
             "This review compares a diff-only pass with a Runtime Review evidence-grounded pass.",
             "",
-            *section("Diff-only verdict", diff),
+            "| Review pass | Verdict | Risks | Best solution | Rank-up moves |",
+            "| --- | --- | --- | --- | --- |",
+            f"| Diff-only | `{compact(diff.get('verdict', 'unknown'))}` | {list_value(diff, 'risks')} | {compact(diff.get('bestSolution', '—'))} | {list_value(diff, 'rankUpMoves')} |",
+            f"| Evidence-grounded | `{compact(evidence.get('verdict', 'unknown'))}` | {list_value(evidence, 'risks')} | {compact(evidence.get('bestSolution', '—'))} | {list_value(evidence, 'rankUpMoves')} |",
             "",
-            *section("Evidence-grounded verdict", evidence),
+            "## Evidence-grounded citations",
+            "",
+            *[f"- {compact(item)}" for item in evidence.get("evidence", [])],
+            f"- Behavior versus baseline: {compact(evidence.get('behaviorVsBaseline', 'No comparison supplied.'))}",
             "",
             "## Runtime evidence",
             "",
             f"- Head commit: `{evidence.get('runtime', {}).get('commit', context['head_sha'])}`",
             f"- Runtime Review comment: {evidence.get('runtime', {}).get('comment_url', 'not found')}",
-            f"- Public profile: {evidence.get('runtime', {}).get('profile', {}).get('url', 'not found')}",
+            f"- Public profile: {evidence.get('runtime', {}).get('profile', {}).get('_source_url', 'not found')}",
         ]
     ) + "\n"
 
