@@ -852,11 +852,6 @@ jobs:
           fi
           git -C "$GITHUB_WORKSPACE" checkout --detach refs/remotes/origin/checkout
 
-      - name: Start Garnet runtime sensor
-        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
-        with:
-          api_token: ${{ secrets.GARNET_API_TOKEN }}
-
       - name: Resolve security diff base
         id: diff_base
         env:
@@ -1072,11 +1067,6 @@ jobs:
       gateway-watch-result: ${{ steps.built_artifact_checks.outputs['gateway-watch-result'] }}
     steps:
       - *linux_node_checkout_step
-      - name: Start Garnet runtime sensor
-        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
-        with:
-          api_token: ${{ secrets.GARNET_API_TOKEN }}
-
       - name: Ensure secrets base commit (PR fast path)
         if: github.event_name == 'pull_request'
         uses: ./.github/actions/ensure-base-commit
@@ -1508,11 +1498,6 @@ jobs:
       matrix: ${{ fromJson(needs.preflight.outputs.checks_fast_core_matrix) }}
     steps:
       - *linux_node_checkout_step
-      - name: Start Garnet runtime sensor
-        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
-        with:
-          api_token: ${{ secrets.GARNET_API_TOKEN }}
-
       - name: Prepare release-gate max-lines merge tree
         if: matrix.task == 'max-lines-ratchet' && github.event_name == 'workflow_dispatch' && inputs.release_gate
         env:
@@ -2685,11 +2670,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - *linux_node_checkout_step
-      - name: Start Garnet runtime sensor
-        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
-        with:
-          api_token: ${{ secrets.GARNET_API_TOKEN }}
-
       - name: Setup Node environment
         uses: ./.github/actions/setup-node-env
         with:
