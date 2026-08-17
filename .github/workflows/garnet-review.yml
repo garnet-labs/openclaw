@@ -1,0 +1,88 @@
+name: Garnet Review
+
+on:
+  pull_request:
+    types: [labeled, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: garnet-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: >-
+      !github.event.pull_request.draft
+      && (
+        github.event.label.name == 'garnet-review'
+        || (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'garnet-review'))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          filter: blob:none
+          fetch-depth: 0
+
+      - name: Fetch PR head ref
+        run: git fetch --filter=blob:none origin pull/${{ github.event.pull_request.number }}/head
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+
+      - name: Run Garnet review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv run tools/garnet-review/review_pr.py \
+            "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --baseline "${{ vars.GARNET_BASELINE_PR }}" \
+            --output-json /tmp/garnet-review.json
+
+      - name: Post sticky review
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/${REPO}/actions/runs/${{ github.run_id }}"
+          if [ -f /tmp/garnet-review.json ]; then
+            BODY=$(jq -r '.review_body // ""' /tmp/garnet-review.json)
+          else
+            BODY=$(printf '%s\n' \
+              '<!-- garnet-review-sticky -->' \
+              "# Garnet review: PR ${PR}" \
+              '' \
+              '**Final verdict: needs-human** (review unavailable)' \
+              '' \
+              "The reviewer did not produce a verdict. Check the workflow run: ${RUN_URL}")
+          fi
+          printf '%s\n' "${BODY}" > /tmp/garnet-review-comment.md
+          COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
+            --jq '.[] | select(.body | startswith("<!-- garnet-review-sticky -->")) | .id' | head -1)
+          if [ -n "${COMMENT_ID}" ]; then
+            gh api -X PATCH "repos/${REPO}/issues/comments/${COMMENT_ID}" \
+              -F body=@/tmp/garnet-review-comment.md
+          else
+            gh api -X POST "repos/${REPO}/issues/${PR}/comments" \
+              -F body=@/tmp/garnet-review-comment.md
+          fi
+
+      - name: Upload review artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: garnet-review-${{ github.event.pull_request.number }}
+          path: /tmp/garnet-review.json
+          if-no-files-found: warn
+          retention-days: 30
