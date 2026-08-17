@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout base branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           filter: blob:none
@@ -34,7 +34,7 @@ jobs:
         run: git fetch --filter=blob:none origin pull/${{ github.event.pull_request.number }}/head
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
         with:
           enable-cache: false
 
@@ -58,17 +58,16 @@ jobs:
           RUN_URL="${{ github.server_url }}/${REPO}/actions/runs/${{ github.run_id }}"
           if [ -f /tmp/garnet-review.json ]; then
             BODY=$(jq -r '.review_body // ""' /tmp/garnet-review.json)
-            VERDICT=$(jq -r '.final_verdict // "needs-human"' /tmp/garnet-review.json)
           else
-            VERDICT="needs-human"
-            BODY="The reviewer did not produce a verdict. Check the workflow run: ${RUN_URL}"
+            BODY=$(printf '%s\n' \
+              '<!-- garnet-review-sticky -->' \
+              "# Garnet review: PR ${PR}" \
+              '' \
+              '**Final verdict: needs-human** (review unavailable)' \
+              '' \
+              "The reviewer did not produce a verdict. Check the workflow run: ${RUN_URL}")
           fi
-          {
-            echo "<!-- garnet-review-sticky -->"
-            echo "> **Garnet review: ${VERDICT}**"
-            echo
-            printf '%s\n' "${BODY}"
-          } > /tmp/garnet-review-comment.md
+          printf '%s\n' "${BODY}" > /tmp/garnet-review-comment.md
           COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
             --jq '.[] | select(.body | startswith("<!-- garnet-review-sticky -->")) | .id' | head -1)
           if [ -n "${COMMENT_ID}" ]; then
@@ -81,7 +80,7 @@ jobs:
 
       - name: Upload review artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: garnet-review-${{ github.event.pull_request.number }}
           path: /tmp/garnet-review.json
