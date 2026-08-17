@@ -213,7 +213,10 @@ def wait_for_runtime_evidence(
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     evidence = runtime_evidence(repo, number, head_sha)
-    while not evidence.get("present") and time.monotonic() < deadline:
+    while (
+        (not evidence.get("present") or not profile_sets(evidence))
+        and time.monotonic() < deadline
+    ):
         time.sleep(min(interval_seconds, max(0, deadline - time.monotonic())))
         evidence = runtime_evidence(repo, number, head_sha)
     return evidence
@@ -251,7 +254,7 @@ def check_rollup(repo: str, sha: str) -> dict[str, Any]:
     green = sum(item.get("conclusion") == "success" for item in runs)
     red = sum(item.get("conclusion") in {"failure", "cancelled", "timed_out", "action_required"} for item in runs)
     pending = len(runs) - green - red
-    verdict = "PASS" if red == 0 else "FLAG"
+    verdict = "FLAG" if red else ("pending" if pending else "PASS")
     return {
         "verdict": verdict,
         "green": green,
@@ -357,12 +360,18 @@ def configured_baseline(explicit: str) -> str:
 
 
 def behavior_view(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
-    if not current.get("present") or not baseline.get("present"):
-        reasons = []
-        if not current.get("present"):
-            reasons.append(current.get("reason", "Current evidence missing."))
-        if not baseline.get("present"):
-            reasons.append(baseline.get("reason", "Baseline evidence missing."))
+    reasons = []
+    if not current.get("present"):
+        reasons.append(current.get("reason", "Current evidence missing."))
+    if not baseline.get("present"):
+        reasons.append(baseline.get("reason", "Baseline evidence missing."))
+    current_jobs = profile_sets(current) if current.get("present") else {}
+    baseline_jobs = profile_sets(baseline) if baseline.get("present") else {}
+    if current.get("present") and not current_jobs:
+        reasons.append("Current Runtime Review has no resolved public profile evidence.")
+    if baseline.get("present") and not baseline_jobs:
+        reasons.append("Baseline Runtime Review has no resolved public profile evidence.")
+    if reasons:
         return {
             "verdict": "needs-human",
             "risks": reasons,
@@ -370,8 +379,6 @@ def behavior_view(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str
             "behaviorVsBaseline": "Unable to compare because one or both Runtime Review profiles are missing.",
             "deltas": [],
         }
-    current_jobs = profile_sets(current)
-    baseline_jobs = profile_sets(baseline)
     deltas: list[dict[str, Any]] = []
     for job, observed in current_jobs.items():
         base = baseline_jobs.get(
@@ -443,6 +450,15 @@ def behavior_view(current: dict[str, Any], baseline: dict[str, Any]) -> dict[str
     }
 
 
+def overall_verdict(correctness: dict[str, Any], behavior: dict[str, Any]) -> str:
+    verdicts = {correctness.get("verdict"), behavior.get("verdict")}
+    if "FLAG" in verdicts:
+        return "FLAG"
+    if "needs-human" in verdicts or "pending" in verdicts:
+        return "needs-human"
+    return "PASS"
+
+
 def render_markdown(
     context: dict[str, Any],
     correctness: dict[str, Any],
@@ -470,7 +486,7 @@ def render_markdown(
             "<!-- garnet-review-sticky -->",
             f"# Garnet review: PR {context['number']}",
             "",
-            f"**Final verdict: {'FLAG' if 'FLAG' in {correctness['verdict'], behavior['verdict']} else ('needs-human' if 'needs-human' in {correctness['verdict'], behavior['verdict']} else 'PASS')}** "
+            f"**Final verdict: {overall_verdict(correctness, behavior)}** "
             f"(correctness {correctness.get('verdict', 'unknown')} · behavior {behavior.get('verdict', 'unknown')})",
             "",
             "This deterministic gate compares GitHub correctness signals with Runtime Review behavior deltas.",
@@ -535,9 +551,7 @@ def main() -> int:
         "runtime": runtime,
         "baseline": baseline,
         "review_body": render_markdown(context, correctness, behavior, runtime, baseline),
-        "final_verdict": "FLAG" if "FLAG" in {correctness["verdict"], behavior["verdict"]} else (
-            "needs-human" if "needs-human" in {correctness["verdict"], behavior["verdict"]} else "PASS"
-        ),
+        "final_verdict": overall_verdict(correctness, behavior),
     }
     Path(args.output_json).write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({"final_verdict": result["final_verdict"], "output": args.output_json}))
