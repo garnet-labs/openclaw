@@ -4,6 +4,7 @@
  * It can delegate cleanup to a live gateway or run local store maintenance,
  * with dry-run tables that explain every planned pruning action.
  */
+import { visibleWidth } from "../../packages/terminal-core/src/ansi.js";
 import { sanitizeTerminalText } from "../../packages/terminal-core/src/safe-text.js";
 import { isRich, theme } from "../../packages/terminal-core/src/theme.js";
 import { getRuntimeConfig } from "../config/config.js";
@@ -81,7 +82,6 @@ function buildActionRows(params: {
   modelRunPrunedKeys: Set<string>;
   staleKeys: Set<string>;
   cappedKeys: Set<string>;
-  budgetEvictedKeys: Set<string>;
   dmScopeRetiredKeys: Set<string>;
 }): SessionCleanupActionRow[] {
   // Recompute row actions from the preview sets so dry-run output uses the same
@@ -95,7 +95,6 @@ function buildActionRows(params: {
         modelRunPrunedKeys: params.modelRunPrunedKeys,
         staleKeys: params.staleKeys,
         cappedKeys: params.cappedKeys,
-        budgetEvictedKeys: params.budgetEvictedKeys,
         dmScopeRetiredKeys: params.dmScopeRetiredKeys,
       }),
     }),
@@ -129,15 +128,15 @@ function renderLabelSummaries(params: {
   if (summaries.length === 0) {
     return;
   }
-  const labelPad = Math.max(...summaries.map((summary) => summary.label.length));
+  const labelPad = Math.max(...summaries.map((summary) => visibleWidth(summary.label)));
   const totalKept = summaries.reduce((total, summary) => total + summary.kept, 0);
   const totalPruned = summaries.reduce((total, summary) => total + summary.pruned, 0);
   params.runtime.log("");
   params.runtime.log("Summary by Label:");
   for (const summary of summaries) {
-    params.runtime.log(
-      `${summary.label.padEnd(labelPad)}  ${summary.kept} kept, ${summary.pruned} pruned`,
-    );
+    const remaining = labelPad - visibleWidth(summary.label);
+    const paddedLabel = remaining > 0 ? `${summary.label}${" ".repeat(remaining)}` : summary.label;
+    params.runtime.log(`${paddedLabel}  ${summary.kept} kept, ${summary.pruned} pruned`);
   }
   params.runtime.log(`Total: ${totalKept} kept, ${totalPruned} pruned`);
 }
@@ -301,6 +300,7 @@ export async function sessionsCleanupCommand(opts: SessionsCleanupOptions, runti
       allAgents: opts.allAgents,
     },
     runtime,
+    json: opts.json,
   });
   if (!targets) {
     return;

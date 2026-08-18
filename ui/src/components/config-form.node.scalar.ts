@@ -10,10 +10,13 @@ import {
   numericInputConstraints,
 } from "./config-form.constraints.ts";
 import {
+  configEnumOptionLabel,
   getSensitiveRenderState,
   isSecretRefObject,
   jsonValue,
   renderFieldRow,
+  renderRestoreDefaultButton,
+  renderSchemaDefaultDescription,
   renderSensitiveToggleButton,
   wrapSensitiveControl,
   type ConfigNodeRenderParams,
@@ -61,8 +64,17 @@ function syncScalarInputIdentity(
       previous.presentationIdentity !== presentationIdentity ||
       previous.renderedValue !== renderedValue
     ) {
-      element.value = renderedValue;
-      setControlValidity(element, "");
+      // A focused input whose DOM value drifted from the last render holds an
+      // in-flight edit the model has not committed yet (mid-keystroke or
+      // mid-automation fill). Resetting it here silently eats that input when
+      // a background config refresh lands; blurred fields keep the
+      // authoritative-reset contract.
+      if (element.matches(":focus") && element.value !== previous.renderedValue) {
+        revalidate(element);
+      } else {
+        element.value = renderedValue;
+        setControlValidity(element, "");
+      }
     } else if (!Object.is(previous.controlIdentity, controlIdentity)) {
       revalidate(element);
     }
@@ -91,6 +103,57 @@ function shouldClearOptionalEmpty(
 
 function numericConstraintMessage(value: number, schema: ConfigNodeRenderParams["schema"]): string {
   return isSupportedConfigValueValid(schema, value) ? "" : t("configForm.invalidNumber");
+}
+
+type NumericInputState =
+  | { kind: "badInput" }
+  | { kind: "empty" }
+  | { kind: "value"; parsed: number; message: string };
+
+// Partial numeric text ("3.", "-", "1e") reports value === "" with
+// validity.badInput set. Treating it as an intentional clear committed
+// undefined mid-keystroke, wiping the stored value and the user's input.
+function resolveNumericInputState(
+  target: HTMLInputElement,
+  schema: ConfigNodeRenderParams["schema"],
+): NumericInputState {
+  const raw = target.value;
+  if (raw.trim() === "") {
+    return target.validity.badInput ? { kind: "badInput" } : { kind: "empty" };
+  }
+  const parsed = Number(raw);
+  return { kind: "value", parsed, message: numericConstraintMessage(parsed, schema) };
+}
+
+function numericStateMessage(state: NumericInputState, isRequired: boolean): string {
+  if (state.kind === "value") {
+    return state.message;
+  }
+  return state.kind === "badInput" || isRequired ? t("configForm.invalidNumber") : "";
+}
+
+function applyNumericInputState(
+  target: HTMLInputElement,
+  state: NumericInputState,
+  params: { isRequired?: boolean },
+  commit: (candidate: unknown) => unknown,
+): void {
+  if (!setControlValidity(target, numericStateMessage(state, params.isRequired === true))) {
+    return;
+  }
+  if (state.kind === "empty") {
+    commit(undefined);
+  } else if (state.kind === "value") {
+    commit(Number.isNaN(state.parsed) ? target.value : state.parsed);
+  }
+}
+
+function numericRevalidateMessage(
+  target: HTMLInputElement,
+  schema: ConfigNodeRenderParams["schema"],
+  isRequired: boolean,
+): string {
+  return numericStateMessage(resolveNumericInputState(target, schema), isRequired);
 }
 
 export function renderTextInput(
@@ -150,14 +213,9 @@ export function renderTextInput(
       return;
     }
     if (inputType === "number") {
-      const raw = target.value;
       setControlValidity(
         target,
-        raw.trim() === ""
-          ? params.isRequired
-            ? t("configForm.invalidNumber")
-            : ""
-          : numericConstraintMessage(Number(raw), schema),
+        numericRevalidateMessage(target, schema, params.isRequired === true),
       );
       return;
     }
@@ -209,19 +267,12 @@ export function renderTextInput(
         const target = event.target as HTMLInputElement;
         const raw = target.value;
         if (inputType === "number") {
-          if (raw.trim() === "") {
-            if (params.isRequired) {
-              setControlValidity(target, t("configForm.invalidNumber"));
-            } else {
-              setControlValidity(target, "");
-              commitScalarValue(target, undefined);
-            }
-            return;
-          }
-          const parsed = Number(raw);
-          if (setControlValidity(target, numericConstraintMessage(parsed, schema))) {
-            commitScalarValue(target, Number.isNaN(parsed) ? raw : parsed);
-          }
+          applyNumericInputState(
+            target,
+            resolveNumericInputState(target, schema),
+            params,
+            (candidate) => commitScalarValue(target, candidate),
+          );
           return;
         }
         if (shouldClearOptionalEmpty(raw, schema, params.isRequired === true)) {
@@ -282,25 +333,21 @@ export function renderTextInput(
     : wrappedInput;
   const control = html`
     ${presentedInput}
-    ${schema.default !== undefined
-      ? html`
-          <openclaw-tooltip .content=${t("configForm.resetToDefault")}>
-            <button
-              type="button"
-              class="btn btn--icon"
-              style="width:28px;height:28px;padding:0;"
-              aria-label=${t("configForm.resetToDefault")}
-              ?disabled=${disabled || effectiveRedacted}
-              @click=${() => onPatch(path, schema.default)}
-            >
-              ↺
-            </button>
-          </openclaw-tooltip>
-        `
-      : nothing}
+    ${renderRestoreDefaultButton({
+      ...params,
+      disabled: disabled || effectiveRedacted,
+    })}
   `;
 
-  return renderFieldRow({ label, help, helpId, tags, showLabel, control });
+  return renderFieldRow({
+    label,
+    help,
+    helpId,
+    defaultDescription: effectiveRedacted ? nothing : renderSchemaDefaultDescription(schema, value),
+    tags,
+    showLabel,
+    control,
+  });
 }
 
 export function renderNumberInput(params: ConfigNodeRenderParams): TemplateResult {
@@ -308,7 +355,8 @@ export function renderNumberInput(params: ConfigNodeRenderParams): TemplateResul
   const showLabel = params.showLabel ?? true;
   const { label, help, tags } = resolveFieldMeta(path, schema, hints);
   const helpId = showLabel && help ? configFieldId(path, "description") : undefined;
-  const displayValue = value ?? schema.default ?? "";
+  const displayValue = value ?? "";
+  const effectiveValue = value !== undefined ? value : schema.default;
   const constraints = numericInputConstraints(schema);
   const numericStep = typeof constraints.step === "number" ? constraints.step : 1;
   const controlIdentity = params.controlIdentity ?? params.sourceIdentity ?? value;
@@ -316,14 +364,9 @@ export function renderNumberInput(params: ConfigNodeRenderParams): TemplateResul
   const controlPathKey = configFieldId(path, "scalar-identity");
   const renderedValue = formatUnknownText(displayValue);
   const revalidate = (target: HTMLInputElement) => {
-    const raw = target.value;
     setControlValidity(
       target,
-      raw === ""
-        ? params.isRequired
-          ? t("configForm.invalidNumber")
-          : ""
-        : numericConstraintMessage(Number(raw), schema),
+      numericRevalidateMessage(target, schema, params.isRequired === true),
     );
   };
   const commitScalarValue = (target: HTMLInputElement, candidate: unknown) => {
@@ -341,7 +384,7 @@ export function renderNumberInput(params: ConfigNodeRenderParams): TemplateResul
     if (disabled) {
       return;
     }
-    const current = Number(displayValue);
+    const current = Number(effectiveValue);
     const base = Number.isFinite(current) ? current : normalizeNumericValue(0, schema);
     const candidate = normalizeNumericValue(base + direction * numericStep, schema);
     if (isSupportedConfigValueValid(schema, candidate)) {
@@ -376,34 +419,39 @@ export function renderNumberInput(params: ConfigNodeRenderParams): TemplateResul
       aria-label=${label}
       aria-describedby=${helpId ?? nothing}
       aria-invalid="false"
+      placeholder=${schema.default !== undefined
+        ? t("configForm.defaultValue", { value: formatUnknownText(schema.default) })
+        : nothing}
       min=${constraints.min ?? nothing}
       max=${constraints.max ?? nothing}
       step=${constraints.step}
       .value=${renderedValue}
       ?disabled=${disabled}
+      @keydown=${(event: KeyboardEvent) => {
+        if (
+          value === undefined &&
+          effectiveValue !== undefined &&
+          (event.key === "ArrowUp" || event.key === "ArrowDown")
+        ) {
+          event.preventDefault();
+          step(event.key === "ArrowUp" ? 1 : -1);
+        }
+      }}
       @input=${(event: Event) => {
         const target = event.target as HTMLInputElement;
-        const raw = target.value;
-        if (raw === "") {
-          if (params.isRequired) {
-            setControlValidity(target, t("configForm.invalidNumber"));
-          } else {
-            setControlValidity(target, "");
-            commitScalarValue(target, undefined);
-          }
-          return;
-        }
-        const parsed = raw === "" ? undefined : Number(raw);
-        if (
-          parsed !== undefined &&
-          setControlValidity(target, numericConstraintMessage(parsed, schema))
-        ) {
-          commitScalarValue(target, parsed);
-        }
+        applyNumericInputState(
+          target,
+          resolveNumericInputState(target, schema),
+          params,
+          (candidate) => commitScalarValue(target, candidate),
+        );
       }}
       @change=${(event: Event) => {
         const target = event.target as HTMLInputElement;
         if (target.value === "") {
+          if (target.validity.badInput) {
+            setControlValidity(target, t("configForm.invalidNumber"));
+          }
           return;
         }
         const parsed = Number(target.value);
@@ -427,9 +475,18 @@ export function renderNumberInput(params: ConfigNodeRenderParams): TemplateResul
     >
       +
     </button>
+    ${renderRestoreDefaultButton(params)}
   `;
 
-  return renderFieldRow({ label, help, helpId, tags, showLabel, control });
+  return renderFieldRow({
+    label,
+    help,
+    helpId,
+    defaultDescription: renderSchemaDefaultDescription(schema, value),
+    tags,
+    showLabel,
+    control,
+  });
 }
 
 export function renderSelect(
@@ -439,15 +496,17 @@ export function renderSelect(
   const showLabel = params.showLabel ?? true;
   const { label, help, tags } = resolveFieldMeta(path, schema, hints);
   const helpId = showLabel && help ? configFieldId(path, "description") : undefined;
-  const resolvedValue = value !== undefined ? value : schema.default;
+  const usingDefault = value === undefined && schema.default !== undefined;
+  const resolvedValue = usingDefault ? schema.default : value;
   const currentIndex = options.findIndex(
     (option) => option === resolvedValue || String(option) === String(resolvedValue),
   );
   const unset = "__unset__";
   const nullValue = "__null__";
   const canSelectNull = schema.nullable && schema.enumIncludesNull;
-  const selectedValue =
-    resolvedValue === null && canSelectNull
+  const selectedValue = usingDefault
+    ? unset
+    : resolvedValue === null && canSelectNull
       ? nullValue
       : currentIndex >= 0
         ? String(currentIndex)
@@ -463,23 +522,36 @@ export function renderSelect(
       @change=${(event: Event) => {
         const target = event.target as HTMLSelectElement;
         const nextSelection = target.value;
-        if (nextSelection === unset && params.isRequired) {
+        if (nextSelection === unset && params.isRequired && schema.default === undefined) {
           target.value = selectedValue;
           return;
         }
-        const candidate =
-          nextSelection === unset
-            ? undefined
-            : nextSelection === nullValue
-              ? null
-              : options[Number(nextSelection)];
+        if (nextSelection === unset) {
+          const accepted =
+            params.isRequired && schema.default !== undefined
+              ? onPatch(path, structuredClone(schema.default))
+              : params.onRemove
+                ? params.onRemove(path)
+                : onPatch(path, undefined);
+          if (accepted === false) {
+            target.value = selectedValue;
+          }
+          return;
+        }
+        const candidate = nextSelection === nullValue ? null : options[Number(nextSelection)];
         if (onPatch(path, candidate) === false) {
           target.value = selectedValue;
         }
       }}
     >
-      <option value=${unset} ?selected=${selectedValue === unset} ?disabled=${params.isRequired}>
-        ${t("configForm.select")}
+      <option
+        value=${unset}
+        ?selected=${selectedValue === unset}
+        ?disabled=${params.isRequired && schema.default === undefined}
+      >
+        ${schema.default !== undefined
+          ? t("configForm.defaultValue", { value: formatUnknownText(schema.default) })
+          : t("configForm.select")}
       </option>
       ${canSelectNull
         ? html`
@@ -490,13 +562,21 @@ export function renderSelect(
         : nothing}
       ${options.map(
         (option, index) => html`
-          <option value=${String(index)} ?selected=${index === currentIndex}>
-            ${String(option)}
+          <option value=${String(index)} ?selected=${selectedValue === String(index)}>
+            ${configEnumOptionLabel(option, options)}
           </option>
         `,
       )}
     </select>
   `;
 
-  return renderFieldRow({ label, help, helpId, tags, showLabel, control });
+  return renderFieldRow({
+    label,
+    help,
+    helpId,
+    defaultDescription: renderSchemaDefaultDescription(schema, value),
+    tags,
+    showLabel,
+    control,
+  });
 }

@@ -1,17 +1,19 @@
 // Imessage plugin module implements channel behavior.
 import { buildDmGroupAccountAllowlistAdapter } from "openclaw/plugin-sdk/allowlist-config-edit";
+import type { ChannelApprovalKind } from "openclaw/plugin-sdk/approval-handler-runtime";
 import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import {
   createMessageReceiptFromOutboundResults,
   defineChannelMessageAdapter,
   type ChannelMessageSendResult,
   type MessageReceiptPartKind,
+  sanitizeForPlainText,
 } from "openclaw/plugin-sdk/channel-outbound";
-import { sanitizeForPlainText } from "openclaw/plugin-sdk/channel-outbound";
 import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-send-result";
 import { buildPassiveProbedChannelStatusSummary } from "openclaw/plugin-sdk/extension-shared";
 import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import { questionGatewayRuntime } from "openclaw/plugin-sdk/question-gateway-runtime";
+import { chunkMarkdownText } from "openclaw/plugin-sdk/reply-runtime";
 import { buildOutboundBaseSessionKey, type RoutePeer } from "openclaw/plugin-sdk/routing";
 import {
   createComputedAccountStatusAdapter,
@@ -24,7 +26,6 @@ import {
   shouldSuppressLocalIMessageExecApprovalPrompt,
 } from "./approval-native.js";
 import {
-  chunkTextForOutbound,
   collectStatusIssuesFromLastError,
   DEFAULT_ACCOUNT_ID,
   formatTrimmedAllowFromEntries,
@@ -42,9 +43,12 @@ import {
   resolveIMessageGroupRequireMention,
   resolveIMessageGroupToolPolicy,
 } from "./group-policy.js";
-import { sanitizeOutboundText } from "./monitor/sanitize-outbound.js";
+import {
+  sanitizeIMessageFinalOutboundText,
+  sanitizeOutboundText,
+} from "./monitor/sanitize-outbound.js";
 import type { IMessageProbe } from "./probe.js";
-import { imessageSetupAdapter, imessageSetupContract } from "./setup-core.js";
+import { imessageSetupContract } from "./setup-core.js";
 import {
   createIMessagePluginBase,
   imessageSecurityAdapter,
@@ -97,7 +101,7 @@ const loadIMessageQuestionReactionsModule = createLazyRuntimeModule(
 
 async function prepareForwardedIMessageApprovalPayload(params: {
   payload: Parameters<NonNullable<ChannelOutboundAdapter["beforeDeliverPayload"]>>[0]["payload"];
-  approvalKind: "exec" | "plugin";
+  approvalKind: ChannelApprovalKind;
 }): Promise<void> {
   const prepared = (
     await loadIMessageApprovalReactionsModule()
@@ -166,13 +170,28 @@ const imessageMessageAdapter = defineChannelMessageAdapter({
         to: ctx.to,
         text: ctx.text,
         mediaUrl: ctx.mediaUrl,
+        mediaAccess: ctx.mediaAccess,
         mediaLocalRoots: ctx.mediaLocalRoots,
+        mediaReadFile: ctx.mediaReadFile,
         audioAsVoice: ctx.audioAsVoice,
         accountId: ctx.accountId ?? undefined,
         deps: (ctx as typeof ctx & IMessageMessageContextExtras).deps,
         replyToId: ctx.replyToId ?? undefined,
         conversationReadOrigin: (ctx as typeof ctx & IMessageMessageContextExtras)
           .conversationReadOrigin,
+        ...(ctx.onDeliveryResult
+          ? {
+              onDeliveryResult: async (acceptedResult) => {
+                await ctx.onDeliveryResult?.(
+                  toIMessageMessageSendResult(
+                    acceptedResult,
+                    ctx.audioAsVoice ? "voice" : "media",
+                    ctx.replyToId,
+                  ),
+                );
+              },
+            }
+          : {}),
       });
       return toIMessageMessageSendResult(
         result,
@@ -281,7 +300,6 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
     base: {
       ...createIMessagePluginBase({
         setupWizard: imessageSetupWizard,
-        setup: imessageSetupAdapter,
         setupContract: imessageSetupContract,
       }),
       allowlist: buildDmGroupAccountAllowlistAdapter({
@@ -405,12 +423,14 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
     outbound: {
       base: {
         deliveryMode: "direct",
-        chunker: chunkTextForOutbound,
-        chunkerMode: "text",
+        chunker: chunkMarkdownText,
+        chunkerMode: "markdown",
         textChunkLimit: 4000,
         // Native formatting consumes Markdown ranges, so preserve bold and strike semantics.
         sanitizeText: ({ text }) =>
-          sanitizeForPlainText(sanitizeOutboundText(text), { style: "markdown" }),
+          sanitizeForPlainText(sanitizeIMessageFinalOutboundText(sanitizeOutboundText(text)).text, {
+            style: "markdown",
+          }),
         shouldSuppressLocalPayloadPrompt: ({ cfg, accountId, payload, hint }) =>
           shouldSuppressLocalIMessageExecApprovalPrompt({ cfg, accountId, payload, hint }),
         beforeDeliverPayload: async ({ payload, hint }) => {
@@ -453,11 +473,14 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
           to,
           text,
           mediaUrl,
+          mediaAccess,
           mediaLocalRoots,
+          mediaReadFile,
           audioAsVoice,
           accountId,
           deps,
           replyToId,
+          onDeliveryResult,
         }) =>
           await (
             await loadIMessageChannelRuntime()
@@ -466,11 +489,28 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
             to,
             text,
             mediaUrl,
+            mediaAccess,
             mediaLocalRoots,
+            mediaReadFile,
             audioAsVoice,
             accountId: accountId ?? undefined,
             deps,
             replyToId: replyToId ?? undefined,
+            ...(onDeliveryResult
+              ? {
+                  onDeliveryResult: async (result) => {
+                    await onDeliveryResult({
+                      channel: "imessage",
+                      ...toIMessageMessageSendResult(
+                        result,
+                        audioAsVoice ? "voice" : "media",
+                        replyToId,
+                      ),
+                      messageId: result.messageId,
+                    });
+                  },
+                }
+              : {}),
           }),
       },
     },

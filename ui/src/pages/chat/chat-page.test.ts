@@ -7,8 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const nativeGateways = vi.hoisted(() => ({ current: null as NativeGatewaysCapability | null }));
 
-// The dedicated unit-mock-registry project keeps this complete, side-effect-only
-// module mock from sharing a worker's mock registry with component tests.
+// Keep this complete mock in the dedicated unit-mock-registry project.
 vi.mock("./chat-pane.ts", () => ({}));
 vi.mock("../../app/native-gateways.runtime.ts", () => ({
   nativeGatewaysCapability: () => nativeGateways.current,
@@ -32,7 +31,8 @@ import { SESSION_DRAG_MIME } from "../../lib/sessions/drag.ts";
 import { sessionNavigationTarget } from "../../lib/sessions/route-navigation.ts";
 import { createStorageMock } from "../../test-helpers/storage.ts";
 import { ChatPage } from "./chat-page.ts";
-import { loadChatRoute } from "./route-loader.ts";
+import { routeDraft } from "./route-draft.ts";
+import { loadChatRoute, type SessionChatRouteData } from "./route-loader.ts";
 
 const WORK_SESSION_KEY = "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef";
 const SESSION_VIEWERS_SET_METHOD = "sessions.viewers.set";
@@ -46,12 +46,15 @@ const sessionPath = (sessionKey: string) =>
   sessionNavigationTarget({ face: "chat", sessionKey, fallbackAgentId: "main" }).options.pathname;
 import type { ChatMessageCache } from "./session-message-cache.ts";
 import type { SplitDropZone } from "./split-drop-zone.ts";
-import { insertPane, type ChatSplitLayout } from "./split-layout.ts";
+import type { ChatSplitLayout } from "./split-layout-types.ts";
+import { insertPane } from "./split-layout.ts";
 
 type RenderedPane = HTMLElement & {
   paneId: string;
+  focusComposer: boolean;
   chatMessagesBySession: ChatMessageCache;
   sessionKey: string;
+  presented: boolean;
   active: boolean;
   paneTitle: string;
   narrow: boolean;
@@ -60,7 +63,7 @@ type RenderedPane = HTMLElement & {
   gatewaysSnapshot: NativeGatewaysSnapshot | null;
   onOpenSplitView?: () => void;
   onClosePane?: (paneId: string) => void;
-  onFaceChange?: (face: "chat" | "dashboard") => void;
+  onFaceChange?: (paneId: string, sessionKey: string, face: "chat" | "dashboard") => void;
 };
 
 type RenderedDivider = HTMLElement & { orientation: "horizontal" | "vertical" };
@@ -100,11 +103,11 @@ function setNarrow(page: ChatPage, narrow: boolean) {
 }
 
 function getRouteDraftForActivePane(page: ChatPage): string | undefined {
-  return (
-    page as unknown as {
-      routeDraftForActivePane: () => string | undefined;
-    }
-  ).routeDraftForActivePane();
+  const state = page as unknown as {
+    data: SessionChatRouteData;
+    consumedDraftData: SessionChatRouteData | null;
+  };
+  return routeDraft(state.data, state.consumedDraftData);
 }
 
 function applySessionDrop(page: ChatPage, sessionKey: string, paneId: string, zone: SplitDropZone) {
@@ -139,17 +142,24 @@ function setNavigationContext(page: ChatPage) {
   const setAgent = vi.fn((agentId: string) => {
     agentSelectionState.selectedId = agentId;
   });
+  const chatAttachmentHandoff = {
+    prepare: vi.fn(),
+    consume: vi.fn(() => null),
+    clearPane: vi.fn(),
+    dispose: vi.fn(),
+  };
   const context = {
     basePath: "",
     sessions: { state: { result: null }, subscribe: () => () => undefined, patch },
     agents: { state: { agentsList: { defaultId: "main", mainKey: "main" } } },
-    gateway: { snapshot: { hello: null } },
+    gateway: { snapshot: { hello: null }, subscribe: () => () => undefined },
     navigate,
     replace,
     agentSelection: { state: agentSelectionState, set: setAgent },
+    chatAttachmentHandoff,
   } as unknown as ApplicationContext;
   (page as unknown as { context: ApplicationContext }).context = context;
-  return { context, navigate, replace, setAgent, patch };
+  return { chatAttachmentHandoff, context, navigate, replace, setAgent, patch };
 }
 
 function setViewerPresenceContext(page: ChatPage) {
@@ -253,7 +263,6 @@ describe("chat page split layout host", () => {
       false,
     );
     expect(page.querySelector("resizable-divider")).toBeNull();
-    // The always-on pane header owns the classic split-view opener.
     expect(typeof itemAt(panes, 0, "rendered pane").onOpenSplitView).toBe("function");
   });
 
@@ -299,6 +308,7 @@ describe("chat page split layout host", () => {
 
   it("retains the classic pane element while split view opens and closes", async () => {
     const page = new ChatPage();
+    setNavigationContext(page);
     page.data = { sessionKey: "main" };
     document.body.append(page);
     await page.updateComplete;
@@ -578,7 +588,7 @@ describe("chat page split layout host", () => {
     await page.updateComplete;
 
     const pane = page.querySelector<RenderedPane>("openclaw-chat-pane");
-    pane?.onFaceChange?.("dashboard");
+    pane?.onFaceChange?.(pane.paneId, pane.sessionKey, "dashboard");
     const expectedSearch = catalogSessionSearch(CATALOG_KEY);
     expect(navigation.navigate).toHaveBeenCalledWith("dashboard", {
       pathname: "/dashboard/research",
@@ -613,7 +623,7 @@ describe("chat page split layout host", () => {
     });
     navigation.navigate.mockClear();
     const pane = page.querySelector<RenderedPane>("openclaw-chat-pane");
-    pane?.onFaceChange?.("dashboard");
+    pane?.onFaceChange?.(pane.paneId, pane.sessionKey, "dashboard");
     expect(navigation.navigate).toHaveBeenCalledWith("dashboard", {
       pathname: "/dashboard/main/1234567890",
     });
@@ -717,7 +727,7 @@ describe("chat page split layout host", () => {
     expect(request).toHaveBeenLastCalledWith(SESSION_VIEWERS_SET_METHOD, { sessionKeys: [] });
   });
 
-  it("renders only the active pane from a preserved split on narrow viewports", async () => {
+  it("keeps split panes mounted but presents only the active pane on narrow viewports", async () => {
     stubMatchMedia(true);
     const page = new ChatPage();
     page.data = { sessionKey: "main" };
@@ -726,9 +736,12 @@ describe("chat page split layout host", () => {
     await page.updateComplete;
 
     const panes = [...page.querySelectorAll<RenderedPane>("openclaw-chat-pane")];
-    expect(panes.map((pane) => pane.paneId)).toEqual(["p2"]);
-    expect(itemAt(panes, 0, "rendered pane").active).toBe(true);
-    expect(itemAt(panes, 0, "rendered pane").narrow).toBe(true);
+    expect(panes.map((pane) => pane.paneId)).toEqual(["p1", "p2"]);
+    expect(panes.filter((pane) => pane.active).map((pane) => pane.paneId)).toEqual(["p2"]);
+    expect(panes.every((pane) => pane.narrow)).toBe(true);
+    expect(panes.filter((pane) => pane.presented).map((pane) => pane.paneId)).toEqual(["p2"]);
+    expect(panes[0]?.hasAttribute("inert")).toBe(true);
+    expect(panes[0]?.closest(".chat-split-view__cell--narrow-hidden")).not.toBeNull();
     expect(page.querySelector("resizable-divider")).toBeNull();
   });
 
@@ -749,7 +762,7 @@ describe("chat page split layout host", () => {
 
     const narrowPane = itemAt(
       page.querySelectorAll<RenderedPane>("openclaw-chat-pane"),
-      0,
+      1,
       "active narrow pane",
     );
     expect(narrowPane).toBe(activePane);
@@ -772,7 +785,13 @@ describe("chat page split layout host", () => {
     };
     let notify = () => {};
     (page as unknown as { context: unknown }).context = {
+      agents: { state: { agentsList: null } },
+      gateway: {
+        snapshot: { assistantAgentId: "main", client: null, hello: null, phase: "stopped" },
+        subscribe: () => () => undefined,
+      },
       sessions: {
+        canonicalListRevision: 0,
         state: sessionsState,
         subscribe: (listener: () => void) => {
           notify = listener;
@@ -787,13 +806,15 @@ describe("chat page split layout host", () => {
 
     const paneTitles = () =>
       [...page.querySelectorAll<RenderedPane>("openclaw-chat-pane")].map((pane) => pane.paneTitle);
-    expect(paneTitles()).toEqual(["Main Thread", "Main Thread"]);
+    expect(paneTitles()).toEqual(["Main Session", "Main Session"]);
 
     // Rows arrive under the canonical agent key while the route still says
     // "main"; hello-default resolution plus equivalence matching must find
     // the label anyway — including non-default agent ids.
     (page as unknown as { context: { gateway?: unknown; sessions: unknown } }).context.gateway = {
       snapshot: {
+        assistantAgentId: "dev",
+        client: null,
         hello: {
           snapshot: {
             sessionDefaults: {
@@ -803,7 +824,9 @@ describe("chat page split layout host", () => {
             },
           },
         },
+        phase: "stopped",
       },
+      subscribe: () => () => undefined,
     };
     sessionsState.result = {
       sessions: [{ key: "agent:dev:main", displayName: "Main desk" }],
@@ -837,12 +860,25 @@ describe("chat page split layout host", () => {
       }),
     };
     const page = new ChatPage();
-    (page as unknown as { context: unknown }).context = { sessions: firstSessions };
+    const sharedContext = {
+      agents: { state: { agentsList: null } },
+      gateway: {
+        snapshot: { assistantAgentId: "main", client: null, hello: null, phase: "stopped" },
+        subscribe: () => () => undefined,
+      },
+    };
+    (page as unknown as { context: unknown }).context = {
+      ...sharedContext,
+      sessions: firstSessions,
+    };
     document.body.append(page);
     await page.updateComplete;
 
     expect(firstSessions.subscribe).toHaveBeenCalledOnce();
-    (page as unknown as { context: unknown }).context = { sessions: secondSessions };
+    (page as unknown as { context: unknown }).context = {
+      ...sharedContext,
+      sessions: secondSessions,
+    };
     page.requestUpdate();
     await page.updateComplete;
 

@@ -3,11 +3,13 @@ import type { Model } from "../../llm/types.js";
 import type { ProviderRuntimeModel } from "../../plugins/provider-runtime-model.types.js";
 import { resolveDefaultAgentDir } from "../agent-scope.js";
 import type { AuthProfileCredential } from "../auth-profiles/types.js";
+import { resolveLegacyInheritedAuthDir } from "../legacy-inherited-auth-dir.js";
 import { resolveModelWorkspaceDir } from "../model-discovery-context.js";
 import { modelKey } from "../model-ref-shared.js";
 import { findNormalizedProviderValue, normalizeProviderId } from "../model-selection.js";
 import { buildSuppressedBuiltInModelError } from "../model-suppression.js";
 import {
+  PreparedModelRuntimeOwnerNotPublishedError,
   getPreparedModelRuntimeSnapshot,
   loadPreparedModelRuntimeSnapshot,
   type PreparedModelRuntimeSnapshot,
@@ -19,7 +21,7 @@ import {
   type ModelRegistry,
 } from "../sessions/index.js";
 import { mergeModelMediaInput } from "./model.compat.js";
-import { resolveConfiguredFallbackModel } from "./model.configured-fallback.js";
+import { buildConfiguredFallbackModel } from "./model.configured-fallback.js";
 import {
   applyConfiguredProviderOverrides,
   resolveConfiguredProviderConfig,
@@ -61,7 +63,6 @@ type CommonModelResolutionOptions = {
 type AsyncModelResolutionOptions = CommonModelResolutionOptions & {
   allowBundledStaticCatalogFallback?: boolean;
   preferBundledStaticCatalogTransport?: boolean;
-  retryTransientProviderRuntimeMiss?: boolean;
   agentRuntimeId?: string;
   skipAgentDiscovery?: boolean;
   preparedModelRuntime?: PreparedModelRuntimeSnapshot;
@@ -94,7 +95,7 @@ function resolvePreparedAgentSnapshot(
     ...(agentId ? { agentId } : {}),
     agentDir: resolvedAgentDir,
     config: cfg ?? {},
-    inheritedAuthDir: resolveDefaultAgentDir(cfg ?? {}),
+    inheritedAuthDir: resolveLegacyInheritedAuthDir(cfg ?? {}),
   };
   const published = getPreparedModelRuntimeSnapshot({
     ...base,
@@ -121,7 +122,11 @@ export function resolveModel(
   modelRegistry: ModelRegistry;
 } {
   const resolvedAgentDir = agentDir ?? resolveDefaultAgentDir(cfg ?? {});
-  const derivedWorkspaceDir = resolveModelWorkspaceDir(cfg, options?.workspaceDir);
+  const derivedWorkspaceDir = resolveModelWorkspaceDir(
+    cfg,
+    options?.workspaceDir,
+    options?.agentId,
+  );
   const preparedSnapshot =
     !options?.authStorage || !options?.modelRegistry
       ? resolvePreparedAgentSnapshot(
@@ -135,7 +140,7 @@ export function resolveModel(
   if ((!options?.authStorage || !options?.modelRegistry) && !preparedSnapshot) {
     // Synchronous callers must enter through a lifecycle that already published discovery.
     // Falling back to an empty registry turns a stale/pending generation into a false model miss.
-    throw new Error(
+    throw new PreparedModelRuntimeOwnerNotPublishedError(
       `prepared model runtime is not published for synchronous model resolution (${resolvedAgentDir}); use resolveModelAsync before lifecycle publication`,
     );
   }
@@ -193,7 +198,11 @@ export async function resolveModelAsync(
   modelRegistry: ModelRegistry;
 }> {
   const resolvedAgentDir = agentDir ?? resolveDefaultAgentDir(cfg ?? {});
-  const derivedWorkspaceDir = resolveModelWorkspaceDir(cfg, options?.workspaceDir);
+  const derivedWorkspaceDir = resolveModelWorkspaceDir(
+    cfg,
+    options?.workspaceDir,
+    options?.agentId,
+  );
   const emptyDiscoveryStores =
     options?.skipAgentDiscovery && (!options.authStorage || !options.modelRegistry)
       ? createEmptyAgentDiscoveryStores()
@@ -215,7 +224,7 @@ export async function resolveModelAsync(
           ...(options?.agentId ? { agentId: options.agentId } : {}),
           agentDir: resolvedAgentDir,
           config: cfg ?? {},
-          inheritedAuthDir: resolveDefaultAgentDir(cfg ?? {}),
+          inheritedAuthDir: resolveLegacyInheritedAuthDir(cfg ?? {}),
           ...(derivedWorkspaceDir ? { workspaceDir: derivedWorkspaceDir } : {}),
         })
       : undefined);
@@ -310,6 +319,7 @@ export async function resolveModelAsync(
     authProfileMode: options?.authProfileMode,
     preferredProfile: options?.preferredProfile,
   });
+  const preparedMetadataSnapshot = preparedModelRuntime?.metadataSnapshot;
   let staticCatalogLookup: Promise<ProviderRuntimeModel | undefined> | undefined;
   const resolveStaticCatalogModel = async () => {
     if (!options?.allowBundledStaticCatalogFallback) {
@@ -325,6 +335,7 @@ export async function resolveModelAsync(
         cfg,
         workspaceDir,
         includeRuntimeDiscovery: true,
+        ...(preparedMetadataSnapshot ? { metadataSnapshot: preparedMetadataSnapshot } : {}),
       });
       if (manifestModel) {
         return manifestModel;
@@ -334,6 +345,7 @@ export async function resolveModelAsync(
         modelId: normalizedRef.model,
         cfg,
         workspaceDir,
+        ...(preparedMetadataSnapshot ? { metadataSnapshot: preparedMetadataSnapshot } : {}),
       });
     })();
     return await staticCatalogLookup;
@@ -411,17 +423,11 @@ export async function resolveModelAsync(
       ? explicitModel.model
       : undefined;
   model ??= await resolveDynamicAttempt();
-  if (!model && !explicitModel && options?.retryTransientProviderRuntimeMiss) {
-    // Startup can race the first provider-runtime snapshot load on a fresh
-    // gateway boot. Retry once before surfacing a user-visible "Unknown model"
-    // that disappears on the next message.
-    model = await resolveDynamicAttempt();
-  }
   if (!model && !explicitModel && options?.allowBundledStaticCatalogFallback) {
     model = await resolveStaticCatalogFallbackModel();
   }
   if (!model && !explicitModel && options?.allowBundledStaticCatalogFallback) {
-    model = resolveConfiguredFallbackModel({
+    model = buildConfiguredFallbackModel({
       provider: normalizedRef.provider,
       modelId: normalizedRef.model,
       cfg,

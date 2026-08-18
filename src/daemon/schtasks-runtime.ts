@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import { expectDefined } from "@openclaw/normalization-core";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { findVerifiedGatewayListenerPidsOnPortSync } from "../infra/gateway-processes.js";
-import { inspectPortUsage } from "../infra/ports.js";
+import { inspectPortUsage } from "../infra/ports-inspect.js";
 import {
   getWindowsCmdExePath,
   getWindowsPowerShellExePath,
@@ -133,8 +133,22 @@ export async function removeStartupEntries(
     try {
       await fs.unlink(startupEntryPath);
       stdout.write(`${formatLine("Removed Windows login item", startupEntryPath)}\n`);
-    } catch {}
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") {
+        throw createStartupEntryRemovalError(error);
+      }
+    }
   }
+}
+
+function createStartupEntryRemovalError(error: unknown): Error {
+  const code = (error as NodeJS.ErrnoException).code;
+  // Native filesystem errors include the private Startup-folder path in their messages.
+  return new Error(
+    `Windows login item removal failed${code ? ` (${code})` : ""}. Check permissions and retry.`,
+    { cause: code ? { code } : undefined },
+  );
 }
 
 export async function hasScheduledTaskRunningEvidence(env: GatewayServiceEnv): Promise<boolean> {
@@ -498,10 +512,10 @@ export async function readScheduledTaskRuntime(
       return resolveFallbackRuntime(env);
     }
     const detail = (res.stderr || res.stdout).trim();
-    const missing = normalizeLowercaseStringOrEmpty(detail).includes("cannot find the file");
+    const missing = probeScheduledTaskExists(taskName) === false;
     return {
       status: missing ? "stopped" : "unknown",
-      detail: detail || undefined,
+      ...(!missing && detail ? { detail } : {}),
       missingUnit: missing,
     };
   }

@@ -1,11 +1,7 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it } from "vitest";
 import type { PluginControlUiDescriptor } from "../plugins/host-hooks.js";
-import {
-  pinActivePluginSessionExtensionRegistry,
-  resetPluginRuntimeStateForTest,
-  setActivePluginRegistry,
-} from "../plugins/runtime.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import { createTestRegistry } from "../test-utils/channel-plugins.js";
 import {
   listControlUiPluginTabAuthGrants,
@@ -99,7 +95,7 @@ describe("listControlUiPluginTabs", () => {
     expect(listControlUiPluginTabs([]).map((tab) => tab.id)).toEqual(["beta", "zed", "alpha"]);
   });
 
-  it("projects scoped widget descriptors as namespaced kinds", () => {
+  it("merges the read-scoped core kind into deterministic plugin ordering", () => {
     activateDescriptors([
       {
         pluginId: "workboard",
@@ -123,36 +119,10 @@ describe("listControlUiPluginTabs", () => {
 
     expect(listControlUiPluginWidgetKinds([])).toEqual([]);
     expect(listControlUiPluginWidgetKinds(["operator.read"])).toEqual([
+      { pluginId: "session", kind: "session:progress", label: "Session progress" },
       { pluginId: "workboard", kind: "workboard:card", label: "Workboard card" },
       { pluginId: "workboard", kind: "workboard:mini", label: "Workboard summary" },
     ]);
-  });
-
-  it("survives agent-turn active-registry swaps via the pinned session-extension registry", () => {
-    const gatewayRegistry = createTestRegistry([]);
-    gatewayRegistry.controlUiDescriptors = [
-      {
-        pluginId: "workboard",
-        descriptor: tabDescriptor({
-          id: "card",
-          surface: "widget",
-          label: "Workboard card",
-          requiredScopes: ["operator.read"],
-        }),
-        source: "test:workboard",
-      },
-      { pluginId: "logbook", descriptor: tabDescriptor(), source: "test:logbook" },
-    ];
-    // Gateway startup pins its fully wired registry on the session-extension surface.
-    pinActivePluginSessionExtensionRegistry(gatewayRegistry);
-
-    // Agent-turn standalone loads install a registry without control-UI descriptors.
-    setActivePluginRegistry(createTestRegistry([]));
-
-    expect(listControlUiPluginWidgetKinds(["operator.read"]).map((kind) => kind.kind)).toEqual([
-      "workboard:card",
-    ]);
-    expect(listControlUiPluginTabs(["operator.admin"]).map((tab) => tab.id)).toEqual(["logbook"]);
   });
 
   it("grants only same-plugin gateway routes with least-privilege scopes", () => {

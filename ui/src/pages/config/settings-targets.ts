@@ -54,10 +54,16 @@ export const SETTINGS_SEARCH_TARGETS = {
     searchKeys: [
       "quickSettings.security.gatewayAuth",
       "quickSettings.security.execPolicy",
-      "quickSettings.security.deviceAuth",
       "quickSettings.security.browserEnabled",
       "quickSettings.security.toolProfile",
     ],
+  },
+  secrets: {
+    routeId: "secrets",
+    labelKey: "tabs.secrets",
+    hash: "",
+    searchKeys: [],
+    aliases: "env team store",
   },
   system: {
     routeId: "connection",
@@ -148,6 +154,7 @@ export const SETTINGS_SEARCH_TARGETS = {
       "configView.sidebarPrefs.hint",
       "configView.sidebarPrefs.liveActivity",
       "configView.sidebarPrefs.liveActivityHint",
+      "chat.sidebar.hiddenSessionSections",
       "configView.sessionObserver.title",
       "configView.sessionObserver.hint",
       "configView.sessionObserver.toggle",

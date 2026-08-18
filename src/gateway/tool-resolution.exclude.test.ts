@@ -10,6 +10,8 @@ import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 
 type CreateOpenClawToolsArg = {
+  agentAccountId?: string;
+  agentChannel?: string;
   clientCaps?: string[];
   cronCreatorToolAllowlist?: Array<string | { name: string; pluginId?: string }>;
   inheritedToolAllowlist?: string[];
@@ -17,6 +19,9 @@ type CreateOpenClawToolsArg = {
   pluginToolDenylist?: string[];
   sandboxed?: boolean;
   requesterAgentIdOverride?: string;
+  gatewayCallerAccountId?: string;
+  gatewayCallerChannel?: string | null;
+  sourceReplyOnly?: boolean;
 };
 
 type CreateOpenClawCodingToolsArg = {
@@ -31,6 +36,7 @@ type CreateOpenClawCodingToolsArg = {
     mode: "account";
     ownerSessionKey: string;
     ownerAccountId: string;
+    ownerOrigin: { kind: "external"; channel: string } | { kind: "local" } | { kind: "unknown" };
   };
 };
 
@@ -134,6 +140,33 @@ describe("resolveGatewayScopedTools excludeToolNames", () => {
     expect(readCreateToolsArgs().clientCaps).toEqual(["tool-events", "inline-widgets"]);
   });
 
+  it("passes immutable source-reply authority into message-tool construction", () => {
+    resolveGatewayScopedTools({
+      cfg: {} as OpenClawConfig,
+      sessionKey: "agent:main:telegram:group:chat123",
+      messageProvider: "telegram",
+      currentChannelId: "telegram:chat123",
+      sourceReplyDeliveryMode: "message_tool_only",
+      sourceReplyOnly: true,
+      surface: "loopback",
+    });
+
+    expect(readCreateToolsArgs().sourceReplyOnly).toBe(true);
+  });
+
+  it("does not restrict ordinary message-tool-only turns", () => {
+    resolveGatewayScopedTools({
+      cfg: {} as OpenClawConfig,
+      sessionKey: "agent:main:telegram:group:chat123",
+      messageProvider: "telegram",
+      currentChannelId: "telegram:chat123",
+      sourceReplyDeliveryMode: "message_tool_only",
+      surface: "loopback",
+    });
+
+    expect(readCreateToolsArgs().sourceReplyOnly).toBeUndefined();
+  });
+
   it("filters loopback dedup exclusions without inheriting policy denies", () => {
     const result = resolveGatewayScopedTools({
       cfg: {} as OpenClawConfig,
@@ -171,6 +204,7 @@ describe("resolveGatewayScopedTools excludeToolNames", () => {
         mode: "account",
         ownerSessionKey: "agent:main:qa-channel:group:ops",
         ownerAccountId: "default",
+        ownerOrigin: { kind: "external", channel: "qa-channel" },
       },
     });
 
@@ -188,7 +222,16 @@ describe("resolveGatewayScopedTools excludeToolNames", () => {
           mode: "account",
           ownerSessionKey: "agent:main:qa-channel:group:ops",
           ownerAccountId: "default",
+          ownerOrigin: { kind: "external", channel: "qa-channel" },
         },
+      }),
+    );
+    expect(readCreateToolsArgs()).toEqual(
+      expect.objectContaining({
+        agentChannel: undefined,
+        agentAccountId: undefined,
+        gatewayCallerAccountId: "default",
+        gatewayCallerChannel: "qa-channel",
       }),
     );
     expect(hoisted.createLazyExecToolMock).not.toHaveBeenCalled();
@@ -302,6 +345,7 @@ describe("resolveGatewayScopedTools excludeToolNames", () => {
       "sessions",
       "screen",
       "terminal",
+      "portal",
       "conversations_list",
       "conversations_send",
       "conversations_turn",
@@ -316,6 +360,7 @@ describe("resolveGatewayScopedTools excludeToolNames", () => {
       "sessions",
       "screen",
       "terminal",
+      "portal",
       "conversations_list",
       "conversations_send",
       "conversations_turn",
@@ -382,7 +427,7 @@ describe("resolveGatewayScopedTools excludeToolNames", () => {
     const schemaProperties = presentation?.parameters?.properties;
     expect(
       Object.keys(schemaProperties && typeof schemaProperties === "object" ? schemaProperties : {}),
-    ).toEqual(["command", "workdir", "env", "timeout", "host", "node"]);
+    ).toEqual(["command", "workdir", "env", "timeoutSeconds", "host", "node"]);
     const hostSchema = (
       schemaProperties && typeof schemaProperties === "object"
         ? (schemaProperties as Record<string, unknown>).host

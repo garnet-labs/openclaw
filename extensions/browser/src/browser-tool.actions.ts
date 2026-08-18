@@ -38,6 +38,7 @@ import {
   DEFAULT_BROWSER_ACTION_TIMEOUT_MS,
   DEFAULT_BROWSER_DOWNLOAD_TIMEOUT_MS,
 } from "./browser/constants.js";
+import { formatErrorMessage } from "./infra/errors.js";
 
 const browserToolActionDeps = {
   browserAct,
@@ -49,7 +50,6 @@ const browserToolActionDeps = {
 };
 
 const BROWSER_DOWNLOAD_REQUEST_TIMEOUT_SLACK_MS = 5_000;
-export { executeExtractAction } from "./browser-extract.js";
 
 type BrowserActRequest = Parameters<typeof browserAct>[1];
 type BrowserActRequestWithTimeout = BrowserActRequest & { timeoutMs?: number };
@@ -180,6 +180,25 @@ function formatTabsToolResult(tabs: unknown[]): AgentToolResult<unknown> {
   };
 }
 
+/** Protect page-controlled model text while preserving the shipped structured result contract. */
+export function formatBrowserExternalToolResult(params: {
+  kind: "act" | "download" | "tabs";
+  payload: unknown;
+}): AgentToolResult<unknown> {
+  const result = jsonResult(params.payload);
+  const wrapped = wrapBrowserExternalJson({
+    kind: params.kind,
+    payload: params.payload,
+    includeWarning: false,
+  });
+  // The Browser tool already marks the turn as network-tainted, and replay
+  // strips details; changing this public structured payload breaks callers.
+  return {
+    ...result,
+    content: [{ type: "text", text: wrapped.wrappedText }],
+  };
+}
+
 function formatConsoleToolResult(result: {
   targetId?: string;
   url?: string;
@@ -251,6 +270,7 @@ export async function executeTabsAction(params: {
   timeoutMs?: number;
   proxyRequest: BrowserProxyRequest | null;
   targetId?: string;
+  signal?: AbortSignal;
 }): Promise<AgentToolResult<unknown>> {
   const { baseUrl, profile, timeoutMs, proxyRequest } = params;
   if (proxyRequest) {
@@ -267,9 +287,13 @@ export async function executeTabsAction(params: {
     );
     return formatTabsToolResult(tabs);
   }
-  const tabs = (await browserToolActionDeps.browserTabs(baseUrl, { profile, timeoutMs })).filter(
-    (tab) => !params.targetId || readStringValue(tab.targetId) === params.targetId,
-  );
+  const tabs = (
+    await browserToolActionDeps.browserTabs(baseUrl, {
+      profile,
+      timeoutMs,
+      signal: params.signal,
+    })
+  ).filter((tab) => !params.targetId || readStringValue(tab.targetId) === params.targetId);
   return formatTabsToolResult(tabs);
 }
 
@@ -316,6 +340,7 @@ export async function executeConsoleAction(params: {
   baseUrl?: string;
   profile?: string;
   proxyRequest: BrowserProxyRequest | null;
+  signal?: AbortSignal;
 }): Promise<AgentToolResult<unknown>> {
   const { input, baseUrl, profile, proxyRequest } = params;
   const level = normalizeOptionalString(input.level);
@@ -336,6 +361,7 @@ export async function executeConsoleAction(params: {
     level,
     targetId,
     profile,
+    signal: params.signal,
   });
   return formatConsoleToolResult(result);
 }
@@ -377,6 +403,7 @@ export async function executeDownloadAction(params: {
   baseUrl?: string;
   profile?: string;
   proxyRequest: BrowserProxyRequest | null;
+  signal?: AbortSignal;
   onTabActivity?: (targetId: string | undefined) => void;
 }): Promise<AgentToolResult<unknown>> {
   const { action, input, baseUrl, profile, proxyRequest } = params;
@@ -401,15 +428,17 @@ export async function executeDownloadAction(params: {
           targetId,
           timeoutMs,
           profile,
+          signal: params.signal,
         })
       : await browserToolActionDeps.browserWaitForDownload(baseUrl, {
           path: request.path,
           targetId,
           timeoutMs,
           profile,
+          signal: params.signal,
         });
   params.onTabActivity?.(readStringValue((result as { targetId?: unknown }).targetId) ?? targetId);
-  return jsonResult(result);
+  return formatBrowserExternalToolResult({ kind: "download", payload: result });
 }
 
 /** Execute browser actions with profile-aware timeout defaults and stale-tab recovery. */
@@ -418,15 +447,21 @@ export async function executeActAction(params: {
   baseUrl?: string;
   profile?: string;
   proxyRequest: BrowserProxyRequest | null;
+  signal?: AbortSignal;
   onTabActivity?: (targetId: string | undefined) => void;
+  onTabClose?: (targetId: string | undefined) => void;
 }): Promise<AgentToolResult<unknown>> {
   const { request, baseUrl, profile, proxyRequest } = params;
   const effectiveRequest = withConfiguredActTimeout(request, profile);
   // resolvedTargetId is the id the act actually ran against (retry paths swap
   // it), so page-state capture must use it rather than the original request's.
   const finishActResult = async (result: unknown, resolvedTargetId: string | undefined) => {
-    params.onTabActivity?.(resolvedTargetId);
     const aborted = readBrowserBatchAbort(result);
+    const onTabResult =
+      effectiveRequest.kind === "close" || aborted?.reason === "closed"
+        ? params.onTabClose
+        : params.onTabActivity;
+    onTabResult?.(resolvedTargetId);
     const formatted = formatActToolResult(result, aborted);
     if (!actObservedNavigation(result, aborted)) {
       return formatted;
@@ -439,6 +474,7 @@ export async function executeActAction(params: {
       baseUrl,
       profile,
       proxyRequest,
+      signal: params.signal,
     });
   };
   try {
@@ -452,6 +488,7 @@ export async function executeActAction(params: {
         })
       : await browserToolActionDeps.browserAct(baseUrl, effectiveRequest, {
           profile,
+          signal: params.signal,
         });
     return await finishActResult(
       result,
@@ -460,15 +497,22 @@ export async function executeActAction(params: {
     );
   } catch (err) {
     if (isChromeStaleTargetError(profile, err)) {
+      let tabRefreshError: unknown;
       const tabs = proxyRequest
-        ? ((
-            (await proxyRequest({
-              method: "GET",
-              path: "/tabs",
-              profile,
-            })) as { tabs?: unknown[] }
-          ).tabs ?? [])
-        : await browserToolActionDeps.browserTabs(baseUrl, { profile }).catch(() => []);
+        ? await proxyRequest({ method: "GET", path: "/tabs", profile })
+            .then((result) => (result as { tabs?: unknown[] }).tabs ?? [])
+            .catch((refreshError: unknown) => {
+              params.signal?.throwIfAborted();
+              tabRefreshError = refreshError;
+              return [];
+            })
+        : await browserToolActionDeps
+            .browserTabs(baseUrl, { profile, signal: params.signal })
+            .catch((refreshError: unknown) => {
+              params.signal?.throwIfAborted();
+              tabRefreshError = refreshError;
+              return [];
+            });
       const freshTargetId =
         tabs.length === 1
           ? readStringValue((tabs[0] as { targetId?: unknown } | undefined)?.targetId)
@@ -494,11 +538,18 @@ export async function executeActAction(params: {
             })
           : await browserToolActionDeps.browserAct(baseUrl, retryRequest, {
               profile,
+              signal: params.signal,
             });
         return await finishActResult(
           retryResult,
           readStringValue((retryResult as { targetId?: unknown }).targetId) ??
             readStringValue(retryRequest.targetId),
+        );
+      }
+      if (tabRefreshError) {
+        throw new Error(
+          `Chrome tab not found for profile="${profile}", and refreshing tabs failed: ${formatErrorMessage(tabRefreshError)}. Run action=tabs profile="${profile}" and retry with a returned targetId.`,
+          { cause: err },
         );
       }
       if (!tabs.length) {
@@ -520,7 +571,7 @@ function formatActToolResult(
   result: unknown,
   aborted: BrowserBatchAbort | null,
 ): AgentToolResult<unknown> {
-  const formatted = jsonResult(result);
+  const formatted = formatBrowserExternalToolResult({ kind: "act", payload: result });
   if (!aborted) {
     return formatted;
   }
@@ -528,7 +579,7 @@ function formatActToolResult(
   // finishActResult, so only the closed case tells the model to snapshot manually.
   const note =
     aborted.reason === "navigation"
-      ? `Batch aborted after action ${aborted.afterAction} because the page navigated to ${aborted.url}; ${aborted.skipped} remaining action(s) skipped. Earlier refs are stale.`
+      ? `Batch aborted after action ${aborted.afterAction} because the page navigated; ${aborted.skipped} remaining action(s) skipped. Earlier refs are stale.`
       : `Batch aborted after action ${aborted.afterAction} because the page or browser context closed; ${aborted.skipped} remaining action(s) skipped. Take a new snapshot before continuing.`;
   return {
     ...formatted,

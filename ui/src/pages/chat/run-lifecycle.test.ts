@@ -6,6 +6,7 @@ import type { SessionsListResult } from "../../api/types.ts";
 import { isSessionRunActive } from "../../lib/session-run-state.ts";
 import {
   CHAT_RUN_STATUS_TOAST_DURATION_MS,
+  handleAbortChat,
   hasAbortableSessionRun,
   reconcileChatRunFromCurrentSessionRow,
   reconcileChatRunFromSessionRow,
@@ -18,6 +19,7 @@ type ReconcileHost = Parameters<typeof reconcileChatRunFromCurrentSessionRow>[0]
 type TestRow = {
   key: string;
   hasActiveRun?: boolean;
+  hasActiveSubagentRun?: boolean;
   activeRunIds?: string[];
   status?: string;
   startedAt?: number;
@@ -62,6 +64,75 @@ function makeAbortHost(over: Partial<AbortHost> = {}): AbortHost {
   };
 }
 
+describe("handleAbortChat", () => {
+  it("dispatches sessions.abort when only descendant work remains", async () => {
+    const request = vi.fn(async () => ({ status: "aborted" }));
+    const host = makeAbortHost({
+      client: { request } as unknown as GatewayBrowserClient,
+      sessionsResult: makeSessionsResult([
+        {
+          key: "agent:main",
+          hasActiveRun: false,
+          hasActiveSubagentRun: true,
+          status: "done",
+        },
+      ]),
+    });
+
+    expect(hasAbortableSessionRun(host)).toBe(true);
+    await handleAbortChat(host);
+
+    expect(request).toHaveBeenCalledWith("sessions.abort", {
+      key: "agent:main",
+      clearQueued: true,
+    });
+  });
+
+  it("shows reconnect guidance when an offline session run has no browser run identity", async () => {
+    const request = vi.fn();
+    const client = { request } as unknown as GatewayBrowserClient;
+    const host = makeAbortHost({
+      client,
+      connected: false,
+      chatMessage: "keep this draft",
+      sessionsResult: makeSessionsResult([
+        { key: "agent:main", hasActiveRun: true, status: "running" },
+      ]),
+    });
+
+    expect(hasAbortableSessionRun(host)).toBe(true);
+    await handleAbortChat(host, { preserveDraft: true });
+
+    expect(host.chatError).toBe("Not connected. Try again after reconnecting.");
+    expect(host.lastError).toBe(host.chatError);
+    expect(host.chatMessage).toBe("keep this draft");
+    expect(host.pendingAbort).toBeUndefined();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("keeps offline exact-run stops safely queued for reconnect", async () => {
+    const request = vi.fn();
+    const client = { request } as unknown as GatewayBrowserClient;
+    const host = makeAbortHost({
+      client,
+      connected: false,
+      chatRunId: "run-main",
+      chatMessage: "keep this draft",
+    });
+
+    await handleAbortChat(host, { preserveDraft: true });
+
+    expect(host.pendingAbort).toEqual({
+      sourceClient: client,
+      sessionKey: "agent:main",
+      runId: "run-main",
+    });
+    expect(host.chatMessage).toBe("keep this draft");
+    expect(host.chatError ?? null).toBeNull();
+    expect(request).not.toHaveBeenCalled();
+  });
+});
+
 describe("replayPendingChatAbort", () => {
   it("dispatches a queued exact browser run stop through chat.abort", async () => {
     const request = vi.fn(async () => ({ aborted: true }));
@@ -84,6 +155,33 @@ describe("replayPendingChatAbort", () => {
       runId: "run-main",
     });
     expect(host.pendingAbort).toBeNull();
+  });
+
+  it("denies a queued exact-run stop when the reconnect is read-only", async () => {
+    const request = vi.fn();
+    const client = { request } as unknown as GatewayBrowserClient;
+    const host = makeAbortHost({
+      client,
+      hello: {
+        type: "hello-ok",
+        protocol: 4,
+        auth: { role: "operator", scopes: ["operator.read"] },
+        features: { methods: ["chat.abort"] },
+      },
+      pendingAbort: {
+        sourceClient: client,
+        runId: "run-main",
+        sessionKey: "global",
+        agentId: "work",
+      },
+    });
+
+    await expect(replayPendingChatAbort(host)).resolves.toBe(false);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(host.pendingAbort).toBeNull();
+    expect(host.chatError).toContain("operator.write");
+    expect(host.lastError).toBe(host.chatError);
   });
 
   it("consumes an ambiguously failed exact-run stop without retrying it", async () => {
@@ -141,6 +239,20 @@ function makeHost(over: Partial<ReconcileHost> = {}): ReconcileHost {
   };
 }
 
+type LocalTerminalReconcile = NonNullable<ReconcileHost["lastLocalTerminalReconcile"]>;
+
+function makeLocalTerminalReconcile(
+  overrides: Partial<LocalTerminalReconcile> = {},
+): LocalTerminalReconcile {
+  return {
+    sessionKey: "s1",
+    runId: "r1",
+    phase: "done",
+    sessionStatus: "done",
+    ...overrides,
+  };
+}
+
 function rowActive(host: ReconcileHost): boolean {
   const row = host.sessionsResult?.sessions.find((r) => r.key === host.sessionKey);
   return Boolean(row && isSessionRunActive(row));
@@ -173,9 +285,6 @@ describe("reconcileChatRunLifecycle yielded parent", () => {
         sessionKey: "s1",
         occurredAt: 1,
       },
-      planStatus: {
-        steps: [{ step: "Wait for child completion", status: "in_progress" }],
-      },
     });
 
     reconcileChatRunLifecycle(host, {
@@ -189,7 +298,6 @@ describe("reconcileChatRunLifecycle yielded parent", () => {
     expect(host.chatRunId).toBeNull();
     expect(host.chatStream).toBeNull();
     expect(host.chatRunStatus).toBeNull();
-    expect(host.planStatus).toBeNull();
     expect(host.lastLocalTerminalReconcile).toBeNull();
     expect(host.sessionsResult?.sessions[0]).toMatchObject({
       activeRunIds: [],
@@ -200,16 +308,13 @@ describe("reconcileChatRunLifecycle yielded parent", () => {
 });
 
 describe("reconcileChatRunLifecycle indicators", () => {
-  it("clears plan status on terminal run end", () => {
+  it("clears run-owned transient indicators on terminal run end", () => {
     const host = makeHost({
       chatRunId: "r1",
       knownAgentRunIds: new Set(["r1", "r2"]),
       waitingApprovalStatuses: new Map([
         ["approval-1", { approvalId: "approval-1", toolCallId: "tool-1", runId: "r1" }],
       ]),
-      planStatus: {
-        steps: [{ step: "Finish the run", status: "in_progress" }],
-      },
     });
 
     reconcileChatRunLifecycle(host, {
@@ -218,7 +323,6 @@ describe("reconcileChatRunLifecycle indicators", () => {
       clearLocalRun: true,
     });
 
-    expect(host.planStatus).toBeNull();
     expect(host.knownAgentRunIds).toEqual(new Set(["r2"]));
     expect(host.waitingApprovalStatuses?.size).toBe(0);
   });
@@ -239,28 +343,6 @@ describe("reconcileChatRunLifecycle indicators", () => {
     });
 
     expect(host.waitingApprovalStatuses?.has("approval-1")).toBe(true);
-  });
-
-  it("preserves an owned plan when another run terminates", () => {
-    const host = makeHost({
-      chatRunId: "r1",
-      planStatus: {
-        runId: "r1",
-        steps: [{ step: "Finish the run", status: "in_progress" }],
-      },
-    });
-
-    reconcileChatRunLifecycle(host, {
-      outcome: "done",
-      runId: "r2",
-      clearIndicators: true,
-      clearLocalRun: false,
-    });
-
-    expect(host.planStatus).toEqual({
-      runId: "r1",
-      steps: [{ step: "Finish the run", status: "in_progress" }],
-    });
   });
 });
 
@@ -323,12 +405,7 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
           status: "running",
         },
       ]),
-      lastLocalTerminalReconcile: {
-        sessionKey: "main",
-        runId: "r1",
-        phase: "done",
-        sessionStatus: "done",
-      },
+      lastLocalTerminalReconcile: makeLocalTerminalReconcile({ sessionKey: "main" }),
     });
 
     expect(reconcileChatRunFromCurrentSessionRow(host)).toBe(true);
@@ -337,12 +414,7 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
 
   it("suppresses a stale active row after a recent local completion", () => {
     const host = makeHost({
-      lastLocalTerminalReconcile: {
-        sessionKey: "s1",
-        runId: "r1",
-        phase: "done",
-        sessionStatus: "done",
-      },
+      lastLocalTerminalReconcile: makeLocalTerminalReconcile(),
     });
     expect(reconcileChatRunFromCurrentSessionRow(host)).toBe(true);
     expect(rowActive(host)).toBe(false);
@@ -358,12 +430,7 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
   it("retains the completed run identity while the session row is unavailable", () => {
     const host = makeHost({
       sessionsResult: null,
-      lastLocalTerminalReconcile: {
-        sessionKey: "s1",
-        runId: "r1",
-        phase: "done",
-        sessionStatus: "done",
-      },
+      lastLocalTerminalReconcile: makeLocalTerminalReconcile(),
     });
 
     expect(reconcileChatRunFromCurrentSessionRow(host)).toBe(false);
@@ -379,12 +446,7 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
   it("keeps suppressing the exact completed run without a time limit", () => {
     vi.useFakeTimers();
     const host = makeHost({
-      lastLocalTerminalReconcile: {
-        sessionKey: "s1",
-        runId: "r1",
-        phase: "done",
-        sessionStatus: "done",
-      },
+      lastLocalTerminalReconcile: makeLocalTerminalReconcile(),
     });
     try {
       vi.advanceTimersByTime(60_000);
@@ -400,12 +462,7 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
     const host = makeHost({
       sessionKey: "s2",
       sessionsResult: makeSessionsResult([{ key: "s2", hasActiveRun: true, status: "running" }]),
-      lastLocalTerminalReconcile: {
-        sessionKey: "s1",
-        runId: "r1",
-        phase: "done",
-        sessionStatus: "done",
-      },
+      lastLocalTerminalReconcile: makeLocalTerminalReconcile(),
     });
     expect(reconcileChatRunFromCurrentSessionRow(host)).toBe(false);
     expect(rowActive(host)).toBe(true);
@@ -414,12 +471,7 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
   it("retains completed run identity across a terminal row projection", () => {
     const host = makeHost({
       sessionsResult: makeSessionsResult([{ key: "s1", hasActiveRun: false, status: "done" }]),
-      lastLocalTerminalReconcile: {
-        sessionKey: "s1",
-        runId: "r1",
-        phase: "done",
-        sessionStatus: "done",
-      },
+      lastLocalTerminalReconcile: makeLocalTerminalReconcile(),
     });
     expect(reconcileChatRunFromCurrentSessionRow(host)).toBe(false);
     expect(host.lastLocalTerminalReconcile?.runId).toBe("r1");
@@ -474,12 +526,7 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
           startedAt: Date.now() - 60_000,
         },
       ]),
-      lastLocalTerminalReconcile: {
-        sessionKey: "s1",
-        runId: "r1",
-        phase: "done",
-        sessionStatus: "done",
-      },
+      lastLocalTerminalReconcile: makeLocalTerminalReconcile(),
     });
     expect(reconcileChatRunFromCurrentSessionRow(host)).toBe(false);
     expect(rowActive(host)).toBe(true);
@@ -489,12 +536,7 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
   it("does not suppress an active row without run identity", () => {
     const host = makeHost({
       sessionsResult: makeSessionsResult([{ key: "s1", hasActiveRun: true, status: "running" }]),
-      lastLocalTerminalReconcile: {
-        sessionKey: "s1",
-        runId: "r1",
-        phase: "done",
-        sessionStatus: "done",
-      },
+      lastLocalTerminalReconcile: makeLocalTerminalReconcile(),
     });
 
     expect(reconcileChatRunFromCurrentSessionRow(host)).toBe(false);
@@ -728,12 +770,7 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
         sessionKey: "s1",
         occurredAt: completedAt,
       },
-      lastLocalTerminalReconcile: {
-        sessionKey: "s1",
-        runId: "r1",
-        phase: "done",
-        sessionStatus: "done",
-      },
+      lastLocalTerminalReconcile: makeLocalTerminalReconcile(),
     });
 
     expect(reconcileStaleChatRunAfterSessionStatePublication(host)).toBe(true);
@@ -742,12 +779,7 @@ describe("reconcileChatRunFromCurrentSessionRow stale-active suppression (#87875
 
   it("keeps suppressing repeated stale active refreshes for the completed run", () => {
     const host = makeHost({
-      lastLocalTerminalReconcile: {
-        sessionKey: "s1",
-        runId: "r1",
-        phase: "done",
-        sessionStatus: "done",
-      },
+      lastLocalTerminalReconcile: makeLocalTerminalReconcile(),
     });
 
     expect(reconcileChatRunFromCurrentSessionRow(host)).toBe(true);

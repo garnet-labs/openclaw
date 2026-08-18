@@ -75,12 +75,41 @@ describe("discord config schema", () => {
     expectInvalidDiscordConfig({ mentionAliases: { opslead: "not-a-user-id" } });
   });
 
-  it("rejects legacy nested DM access keys", () => {
-    const issues = expectInvalidDiscordConfig({
-      dm: { policy: "open", allowFrom: [] },
+  it("normalizes shipped nested DM access keys at root and account scope", () => {
+    const cfg = expectValidDiscordConfig({
+      dmPolicy: "pairing",
+      allowFrom: ["canonical-root"],
+      dm: { enabled: false, policy: "open", allowFrom: ["legacy-root"] },
+      accounts: {
+        work: {
+          dmPolicy: "allowlist",
+          allowFrom: ["canonical-account"],
+          dm: { groupEnabled: true, policy: "disabled", allowFrom: ["legacy-account"] },
+        },
+        personal: {
+          dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+        },
+      },
     });
 
-    expect(issues[0]?.path.join(".")).toBe("dm");
+    expect(cfg).toMatchObject({
+      dmPolicy: "pairing",
+      allowFrom: ["canonical-root"],
+      dm: { enabled: false },
+      accounts: {
+        work: {
+          dmPolicy: "allowlist",
+          allowFrom: ["canonical-account"],
+          dm: { groupEnabled: true },
+        },
+        personal: {
+          dmPolicy: "open",
+          allowFrom: ["*"],
+          dm: { enabled: true },
+        },
+      },
+    });
+    expectInvalidDiscordConfig({ dm: { enabled: false, unexpected: true } });
   });
 
   it("accepts textChunkLimit without reviving legacy message limits", () => {
@@ -420,6 +449,14 @@ describe("discord config schema", () => {
     expect(cfg.guilds?.["123456789012345678"]?.presenceEvents?.channelId).toBe(
       "234567890123456789",
     );
+  });
+
+  it("accepts mention-only gateway intent mode", () => {
+    const cfg = expectValidDiscordConfig({
+      intents: { messageContent: false },
+    });
+
+    expect(cfg.intents?.messageContent).toBe(false);
   });
 
   it("accepts online-presence throttling knobs", () => {

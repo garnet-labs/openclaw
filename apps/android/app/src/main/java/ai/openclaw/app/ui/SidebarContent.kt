@@ -2,6 +2,7 @@ package ai.openclaw.app.ui
 
 import ai.openclaw.app.GatewayAgentSummary
 import ai.openclaw.app.GatewayConnectionDisplay
+import ai.openclaw.app.MainViewModel
 import ai.openclaw.app.chat.ChatSessionEntry
 import ai.openclaw.app.i18n.nativeString
 import ai.openclaw.app.selectableAgents
@@ -110,29 +111,34 @@ internal fun sidebarAgentRoster(
 
 internal fun sidebarRecentSessions(
   sessions: List<ChatSessionEntry>,
-  query: String,
   limit: Int = 8,
-): List<ChatSessionEntry> {
-  val normalizedQuery = query.trim().lowercase()
-  return sessions
+): List<ChatSessionEntry> =
+  sessions
     .asSequence()
     .filter { it.archived != true }
-    .filter { session ->
-      normalizedQuery.isEmpty() ||
-        listOfNotNull(session.displayName, session.label, session.key, session.ownerAgentId)
-          .any { it.lowercase().contains(normalizedQuery) }
-    }.sortedWith(
+    .sortedWith(
       compareByDescending<ChatSessionEntry> { it.pinned == true }
         .thenByDescending { it.lastActivityAt ?: it.updatedAtMs ?: 0L }
         .thenBy { it.key },
     ).take(limit.coerceAtLeast(0))
     .toList()
+
+internal fun sessionPresentationTitle(
+  session: ChatSessionEntry,
+  unnamedTitle: () -> String,
+): String =
+  session.label?.trim()?.takeIf(String::isNotEmpty)
+    ?: session.displayName?.trim()?.takeIf(String::isNotEmpty)
+    ?: nativeString("New chat").takeIf { session.isDashboardSession() }
+    ?: unnamedTitle()
+
+private fun ChatSessionEntry.isDashboardSession(): Boolean {
+  if (classification == "dashboard") return true
+  val parts = key.split(':', limit = 4)
+  return parts.size == 4 && parts[0] == "agent" && parts[2] == "dashboard"
 }
 
-internal fun sidebarSessionTitle(session: ChatSessionEntry): String =
-  session.displayName?.trim()?.takeIf(String::isNotEmpty)
-    ?: session.label?.trim()?.takeIf(String::isNotEmpty)
-    ?: session.key
+internal fun sidebarSessionTitle(session: ChatSessionEntry): String = sessionPresentationTitle(session) { session.key }
 
 internal fun sidebarAgentName(agent: GatewayAgentSummary): String = agent.name?.trim()?.takeIf(String::isNotEmpty) ?: agent.id
 
@@ -171,6 +177,7 @@ private fun sidebarPalette(): SidebarPalette {
 
 @Composable
 internal fun OpenClawSidebar(
+  viewModel: MainViewModel,
   agents: List<GatewayAgentSummary>,
   selectedAgentId: String?,
   sessions: List<ChatSessionEntry>,
@@ -188,8 +195,24 @@ internal fun OpenClawSidebar(
   val roster = sidebarAgentRoster(agents, selectedAgentId)
   var query by rememberSaveable { mutableStateOf("") }
   var agentsExpanded by remember { mutableStateOf(false) }
-  val recentSessions = sidebarRecentSessions(sessions, query)
+  val recentSessions = sidebarRecentSessions(sessions)
   val connectionLabel = gatewayStatusLabel(connection)
+  // Canonical debounced gateway search shared with the Sessions browser; the
+  // controller falls back to filtering cached rows when the gateway is offline.
+  val searchState =
+    rememberSessionBrowserSearchState(
+      viewModel = viewModel,
+      sessions = sessions,
+      query = query,
+      archived = false,
+    )
+  val searchResults =
+    resolveSessionBrowserEntries(
+      entries = searchState.entries,
+      currentSessionKey = activeSessionKey,
+      filter = SessionFilter.Recent,
+      recentFirst = true,
+    )
 
   Column(
     modifier =
@@ -199,6 +222,47 @@ internal fun OpenClawSidebar(
         .windowInsetsPadding(WindowInsets.safeDrawing)
         .padding(horizontal = 14.dp, vertical = 10.dp),
   ) {
+    // Header and search stay pinned above the scrolling sections so search is
+    // always reachable no matter how far the section list scrolls.
+    Row(
+      modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+      verticalAlignment = Alignment.CenterVertically,
+      horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+      OpenClawMascot(modifier = Modifier.size(28.dp))
+      Text(
+        text = "OpenClaw",
+        style = ClawTheme.type.title.copy(fontSize = 18.sp, lineHeight = 22.sp),
+        color = palette.text,
+        modifier = Modifier.weight(1f),
+        maxLines = 1,
+      )
+      IconButton(onClick = onOpenSettings, modifier = Modifier.size(48.dp)) {
+        Icon(
+          imageVector = Icons.Default.Settings,
+          contentDescription = nativeString("Open Settings"),
+          tint = palette.text,
+          modifier = Modifier.size(20.dp),
+        )
+      }
+      if (showCloseButton) {
+        IconButton(onClick = onClose, modifier = Modifier.size(48.dp).testTag("sidebar-close")) {
+          Icon(
+            imageVector = Icons.Default.Close,
+            contentDescription = nativeString("Hide Sidebar"),
+            tint = palette.text,
+            modifier = Modifier.size(20.dp),
+          )
+        }
+      }
+    }
+    SidebarSearchField(
+      query = query,
+      onQueryChange = { query = it },
+      palette = palette,
+      modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
+    )
+
     Column(
       modifier =
         Modifier
@@ -206,115 +270,108 @@ internal fun OpenClawSidebar(
           .fillMaxWidth()
           .verticalScroll(rememberScrollState()),
     ) {
-      Row(
-        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-      ) {
-        OpenClawMascot(modifier = Modifier.size(28.dp))
-        Text(
-          text = "OpenClaw",
-          style = ClawTheme.type.title.copy(fontSize = 18.sp, lineHeight = 22.sp),
-          color = palette.text,
-          modifier = Modifier.weight(1f),
-          maxLines = 1,
-        )
-        IconButton(onClick = onOpenSettings, modifier = Modifier.size(48.dp)) {
-          Icon(
-            imageVector = Icons.Default.Settings,
-            contentDescription = nativeString("Open Settings"),
-            tint = palette.text,
-            modifier = Modifier.size(20.dp),
-          )
-        }
-        if (showCloseButton) {
-          IconButton(onClick = onClose, modifier = Modifier.size(48.dp).testTag("sidebar-close")) {
-            Icon(
-              imageVector = Icons.Default.Close,
-              contentDescription = nativeString("Hide Sidebar"),
-              tint = palette.text,
-              modifier = Modifier.size(20.dp),
+      if (searchState.query.isNotEmpty()) {
+        SidebarSectionTitle(nativeString("Threads"), palette)
+        when (sessionEmptyMode(searchState.query, searchState.loading)) {
+          SessionEmptyMode.SearchLoading ->
+            Text(
+              text = nativeString("Searching threads"),
+              style = ClawTheme.type.caption,
+              color = palette.muted,
+              modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
             )
-          }
-        }
-      }
-
-      SidebarSearchField(
-        query = query,
-        onQueryChange = { query = it },
-        palette = palette,
-        modifier = Modifier.padding(top = 4.dp, bottom = 12.dp),
-      )
-
-      SidebarSectionTitle(nativeString("Agents"), palette)
-      roster.selected?.let { selected ->
-        SidebarAgentRow(
-          agent = selected,
-          selected = true,
-          palette = palette,
-          onClick = { onSelectAgent(selected.id) },
-        )
-      }
-      if (roster.others.isNotEmpty()) {
-        Box {
-          SidebarActionRow(
-            label = nativeString("More Agents"),
-            icon = Icons.Default.KeyboardArrowDown,
-            palette = palette,
-            onClick = { agentsExpanded = true },
-          )
-          DropdownMenu(
-            expanded = agentsExpanded,
-            onDismissRequest = { agentsExpanded = false },
-            containerColor = palette.elevated,
-          ) {
-            roster.others.forEach { agent ->
-              DropdownMenuItem(
-                text = {
-                  Text(
-                    text = sidebarAgentName(agent),
-                    color = palette.text,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                  )
-                },
-                onClick = {
-                  agentsExpanded = false
-                  onSelectAgent(agent.id)
-                },
+          else ->
+            if (searchResults.isEmpty()) {
+              Text(
+                text = nativeString("No matching threads"),
+                style = ClawTheme.type.caption,
+                color = palette.muted,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
               )
+            } else {
+              Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                searchResults.forEach { session ->
+                  SidebarSessionRow(
+                    session = session,
+                    selected = session.key == activeSessionKey,
+                    palette = palette,
+                    onClick = { onSelectSession(session) },
+                  )
+                }
+              }
+            }
+        }
+      } else {
+        SidebarSectionTitle(nativeString("Agents"), palette)
+        roster.selected?.let { selected ->
+          SidebarAgentRow(
+            agent = selected,
+            selected = true,
+            palette = palette,
+            onClick = { onSelectAgent(selected.id) },
+          )
+        }
+        if (roster.others.isNotEmpty()) {
+          Box {
+            SidebarActionRow(
+              label = nativeString("More Agents"),
+              icon = Icons.Default.KeyboardArrowDown,
+              palette = palette,
+              onClick = { agentsExpanded = true },
+            )
+            DropdownMenu(
+              expanded = agentsExpanded,
+              onDismissRequest = { agentsExpanded = false },
+              containerColor = palette.elevated,
+            ) {
+              roster.others.forEach { agent ->
+                DropdownMenuItem(
+                  text = {
+                    Text(
+                      text = sidebarAgentName(agent),
+                      color = palette.text,
+                      maxLines = 1,
+                      overflow = TextOverflow.Ellipsis,
+                    )
+                  },
+                  onClick = {
+                    agentsExpanded = false
+                    onSelectAgent(agent.id)
+                  },
+                )
+              }
             }
           }
         }
-      }
 
-      SidebarSectionTitle(nativeString("Pages"), palette, modifier = Modifier.padding(top = 12.dp))
-      SidebarDestination.entries.forEach { destination ->
-        SidebarNavigationRow(
-          destination = destination,
-          selected = destination == activeDestination,
-          palette = palette,
-          onClick = { onSelectDestination(destination) },
-        )
-      }
+        SidebarSectionTitle(nativeString("Pages"), palette, modifier = Modifier.padding(top = 12.dp))
+        SidebarDestination.entries.forEach { destination ->
+          SidebarNavigationRow(
+            destination = destination,
+            selected = destination == activeDestination,
+            palette = palette,
+            onClick = { onSelectDestination(destination) },
+          )
+        }
 
-      SidebarSectionTitle(nativeString("Recent sessions"), palette, modifier = Modifier.padding(top = 12.dp))
-      if (recentSessions.isEmpty()) {
-        Text(
-          text = nativeString("No recent sessions"),
-          style = ClawTheme.type.caption,
-          color = palette.muted,
-          modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
-        )
-      } else {
-        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-          recentSessions.forEach { session ->
-            SidebarSessionRow(
-              session = session,
-              selected = session.key == activeSessionKey,
-              palette = palette,
-              onClick = { onSelectSession(session) },
-            )
+        SidebarSectionTitle(nativeString("Recent sessions"), palette, modifier = Modifier.padding(top = 12.dp))
+        if (recentSessions.isEmpty()) {
+          Text(
+            text = nativeString("No recent sessions"),
+            style = ClawTheme.type.caption,
+            color = palette.muted,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
+          )
+        } else {
+          Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            recentSessions.forEach { session ->
+              SidebarSessionRow(
+                session = session,
+                selected = session.key == activeSessionKey,
+                palette = palette,
+                onClick = { onSelectSession(session) },
+              )
+            }
           }
         }
       }

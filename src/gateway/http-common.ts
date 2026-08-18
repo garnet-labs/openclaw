@@ -8,6 +8,7 @@ import {
 } from "../logging/diagnostic-payload.js";
 import type { GatewayAuthResult } from "./auth.js";
 import { readJsonBody } from "./hooks.js";
+import { PROXY_ATTRIBUTION_REQUIRED_REASON } from "./ingress-attribution.js";
 
 /**
  * Apply baseline security headers that are safe for all response types (API JSON,
@@ -26,6 +27,24 @@ export function setDefaultSecurityHeaders(
   if (typeof strictTransportSecurity === "string" && strictTransportSecurity.length > 0) {
     res.setHeader("Strict-Transport-Security", strictTransportSecurity);
   }
+}
+
+/** Finish a failed request without rewriting committed headers or orphaning its transport. */
+export function finishFailedGatewayHttpResponse(res: ServerResponse): void {
+  if (res.destroyed || res.writableEnded) {
+    return;
+  }
+  if (!res.headersSent) {
+    res.statusCode = 500;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end("Internal Server Error");
+    return;
+  }
+
+  // Flush committed bytes before closing; truncated fixed-length bodies cannot reuse this socket.
+  const socket = res.socket;
+  res.end();
+  socket?.end();
 }
 
 export function sendJson(res: ServerResponse, status: number, body: unknown) {
@@ -66,6 +85,16 @@ export function sendRateLimited(res: ServerResponse, retryAfterMs?: number) {
 export function sendGatewayAuthFailure(res: ServerResponse, authResult: GatewayAuthResult) {
   if (authResult.rateLimited) {
     sendRateLimited(res, authResult.retryAfterMs);
+    return;
+  }
+  if (authResult.reason === PROXY_ATTRIBUTION_REQUIRED_REASON) {
+    sendJson(res, 403, {
+      error: {
+        message:
+          "Proxy client attribution is required. Configure gateway.trustedProxies narrowly and make the proxy overwrite or safely rebuild forwarded client headers.",
+        type: PROXY_ATTRIBUTION_REQUIRED_REASON,
+      },
+    });
     return;
   }
   sendUnauthorized(res);
@@ -182,6 +211,18 @@ export function watchClientDisconnect(
       abortController.abort(new ClientDisconnectError());
     }
   };
+  const stopWatchingResponseErrors = () => {
+    res.off("error", handleClose);
+    res.off("close", stopWatchingResponseErrors);
+  };
+  // Finalizers release socket watchers before res.end(); keep its error
+  // listener until close so a failed flush cannot become process-fatal.
+  res.on("error", handleClose);
+  res.once("close", stopWatchingResponseErrors);
+  if (res.destroyed || sockets.some((socket) => socket.destroyed)) {
+    handleClose();
+    return () => {};
+  }
   for (const socket of sockets) {
     socket.on("close", handleClose);
   }

@@ -49,6 +49,101 @@ describe("qa suite summary helpers", () => {
     }
   });
 
+  it.each([
+    ["failure", readQaSuiteFailedScenarioCountFromFile],
+    ["failure and skip", readQaSuiteFailedOrSkippedScenarioCountFromFile],
+  ] as const)("rejects a positive total without accounted %s outcomes", async (_name, reader) => {
+    await expect(
+      readSummary({ counts: { total: 1, passed: 0, failed: 0, skipped: 0 } }, reader),
+    ).rejects.toMatchObject({ code: "summary_counts_invalid" });
+  });
+
+  it.each([
+    {
+      name: "unaccounted total",
+      summary: {
+        counts: { total: 2, passed: 1, failed: 0, skipped: 0 },
+        scenarios: [{ status: "pass" }],
+      },
+    },
+    {
+      name: "contradictory pass count",
+      summary: {
+        counts: { total: 1, passed: 0, failed: 0, skipped: 0 },
+        scenarios: [{ status: "pass" }],
+      },
+    },
+    {
+      name: "contradictory scenario statuses",
+      summary: {
+        counts: { total: 2, passed: 1, failed: 1, skipped: 0 },
+        scenarios: [{ status: "pass" }, { status: "pass" }],
+      },
+    },
+  ])("rejects complete suite accounting with $name", async ({ summary }) => {
+    for (const reader of [
+      readQaSuiteFailedScenarioCountFromFile,
+      readQaSuiteFailedOrSkippedScenarioCountFromFile,
+    ]) {
+      await expect(readSummary(summary, reader)).rejects.toMatchObject({
+        code: "summary_counts_invalid",
+      });
+    }
+  });
+
+  it("rejects a claimed pass that contradicts observed skipped-only scenarios", async () => {
+    const summary = {
+      counts: { total: 1, passed: 1, failed: 0, skipped: 0 },
+      scenarios: [{ name: "never executed", status: "skip" }],
+    };
+
+    for (const reader of [
+      readQaSuiteFailedScenarioCountFromFile,
+      readQaSuiteFailedOrSkippedScenarioCountFromFile,
+    ]) {
+      await expect(readSummary(summary, reader)).rejects.toMatchObject({
+        code: "summary_counts_invalid",
+      });
+    }
+  });
+
+  it.each([
+    ["null", null],
+    ["array", []],
+    ["string", "corrupt counts"],
+    ["number", 1],
+  ] as const)(
+    "rejects %s counts containers even when a scenario claims to pass",
+    async (_name, counts) => {
+      const summary = { counts, scenarios: [{ status: "pass" }] };
+
+      await expect(readSummary(summary, readQaSuiteFailedScenarioCountFromFile)).rejects.toThrow(
+        "counts must be a non-array object",
+      );
+      await expect(
+        readSummary(summary, readQaSuiteFailedOrSkippedScenarioCountFromFile),
+      ).rejects.toThrow("counts must be a non-array object");
+    },
+  );
+
+  it.each([
+    ["negative failed", { total: 1, passed: 1, failed: -1, skipped: 0 }],
+    ["fractional failed", { total: 1, passed: 1, failed: 0.75, skipped: 0 }],
+    ["unsafe passed", { total: 1, passed: Number.MAX_SAFE_INTEGER + 1, failed: 0, skipped: 0 }],
+  ] as const)(
+    "rejects %s instead of normalizing an invalid execution count",
+    async (_name, counts) => {
+      const summary = { counts, scenarios: [{ status: "pass" }] };
+
+      await expect(readSummary(summary, readQaSuiteFailedScenarioCountFromFile)).rejects.toThrow(
+        "must be a non-negative safe integer",
+      );
+      await expect(
+        readSummary(summary, readQaSuiteFailedOrSkippedScenarioCountFromFile),
+      ).rejects.toThrow("must be a non-negative safe integer");
+    },
+  );
+
   it("counts failed and skipped scenarios from scenario statuses", async () => {
     await expect(
       readSummary(
@@ -91,6 +186,60 @@ describe("qa suite summary helpers", () => {
     await expect(readSummary(summary, readQaSuiteFailedScenarioCountFromFile)).resolves.toBe(1);
     await expect(
       readSummary(summary, readQaSuiteFailedOrSkippedScenarioCountFromFile),
+    ).resolves.toBe(1);
+  });
+
+  it.each([
+    {
+      name: "required skip",
+      summary: {
+        counts: { total: 1, passed: 0, failed: 0, skipped: 1 },
+        scenarios: [{ name: "required scenario", status: "skip" }],
+      },
+    },
+    {
+      name: "required skipped",
+      summary: {
+        counts: { total: 1, passed: 0, failed: 0, skipped: 1 },
+        scenarios: [{ name: "required scenario", status: "skipped" }],
+      },
+    },
+    {
+      name: "blocked scenario",
+      summary: {
+        counts: { total: 1 },
+        scenarios: [{ name: "required scenario", status: "blocked" }],
+      },
+    },
+    {
+      name: "blocked evidence",
+      summary: {
+        counts: { total: 1 },
+        entries: [{ result: { status: "blocked" } }],
+      },
+    },
+  ])("requires a completed scenario before tolerating $name", async ({ summary }) => {
+    await expect(
+      readSummary(summary, (summaryPath) =>
+        readQaSuiteFailedOrSkippedScenarioCountFromFile(summaryPath, {
+          requireExecutedScenario: true,
+        }),
+      ),
+    ).rejects.toThrow("did not include any executed scenarios");
+  });
+
+  it("still permits a genuinely executed failed scenario in failure-tolerant gates", async () => {
+    await expect(
+      readSummary(
+        {
+          counts: { total: 1, passed: 0, failed: 1, skipped: 0 },
+          scenarios: [{ name: "required scenario", status: "fail" }],
+        },
+        (summaryPath) =>
+          readQaSuiteFailedOrSkippedScenarioCountFromFile(summaryPath, {
+            requireExecutedScenario: true,
+          }),
+      ),
     ).resolves.toBe(1);
   });
 
@@ -166,23 +315,46 @@ describe("qa suite summary helpers", () => {
     },
   );
 
-  it.each([
-    ["blocked", { status: "blocked" }],
-    ["timeout", { status: "timeout" }],
-    ["error", { status: "error" }],
-    ["missing", {}],
-  ] as const)("keeps standalone %s evidence fail-closed in both gates", async (_name, result) => {
+  it("uses scenario outcomes instead of counting lower-level producer checks", async () => {
     const summary = {
       counts: { total: 1, passed: 1, failed: 0, skipped: 0 },
       scenarios: [{ status: "pass" }],
-      entries: [{ result }],
+      evidence: {
+        entries: [{ result: { status: "blocked" } }, { result: { status: "pass" } }],
+      },
     };
 
-    await expect(readSummary(summary, readQaSuiteFailedScenarioCountFromFile)).resolves.toBe(1);
-    await expect(
-      readSummary(summary, readQaSuiteFailedOrSkippedScenarioCountFromFile),
-    ).resolves.toBe(1);
+    for (const reader of [
+      readQaSuiteFailedScenarioCountFromFile,
+      readQaSuiteFailedOrSkippedScenarioCountFromFile,
+    ]) {
+      await expect(readSummary(summary, reader)).resolves.toBe(0);
+    }
   });
+
+  it.each([
+    ["timeout", { status: "timeout" }],
+    ["error", { status: "error" }],
+    ["missing", {}],
+  ] as const)(
+    "rejects unsupported %s evidence alongside complete counts",
+    async (_name, result) => {
+      const summary = {
+        counts: { total: 1, passed: 1, failed: 0, skipped: 0 },
+        scenarios: [{ status: "pass" }],
+        entries: [{ result }],
+      };
+
+      for (const reader of [
+        readQaSuiteFailedScenarioCountFromFile,
+        readQaSuiteFailedOrSkippedScenarioCountFromFile,
+      ]) {
+        await expect(readSummary(summary, reader)).rejects.toMatchObject({
+          code: "summary_counts_invalid",
+        });
+      }
+    },
+  );
 
   it("rejects evidence-only results without an observed status", async () => {
     await expect(
@@ -284,7 +456,7 @@ describe("qa suite summary helpers", () => {
     ).resolves.toBe(1);
   });
 
-  it("never lets an optional skip cancel a declared failure or unknown evidence", async () => {
+  it("rejects optional skip summaries that contradict counts", async () => {
     const optionalScenario = {
       name: "optional tool fixture",
       status: "skip",
@@ -303,17 +475,7 @@ describe("qa suite summary helpers", () => {
         },
         readWithOptionalPolicy,
       ),
-    ).resolves.toBe(1);
-    await expect(
-      readSummary(
-        {
-          counts: { total: 1, passed: 0, failed: 0, skipped: 1 },
-          scenarios: [optionalScenario],
-          entries: [{ result: { status: "timeout" } }],
-        },
-        readWithOptionalPolicy,
-      ),
-    ).resolves.toBe(1);
+    ).rejects.toMatchObject({ code: "summary_counts_invalid" });
   });
 
   it("uses the larger failure signal when counts and scenarios disagree", async () => {
@@ -325,7 +487,7 @@ describe("qa suite summary helpers", () => {
     ).resolves.toBe(1);
     await expect(
       readSummary(
-        { counts: { failed: 3.8 }, scenarios: [{ status: "pass" }, { status: "fail" }] },
+        { counts: { failed: 3 }, scenarios: [{ status: "pass" }, { status: "fail" }] },
         readQaSuiteFailedScenarioCountFromFile,
       ),
     ).resolves.toBe(3);
@@ -340,13 +502,15 @@ describe("qa suite summary helpers", () => {
     ).resolves.toBe(1);
   });
 
-  it("counts evidence entry results", async () => {
+  it("counts canonical evidence entry results", async () => {
     const summary = {
-      entries: [
-        { result: { status: "pass" } },
-        { result: { status: "fail" } },
-        { result: { status: "skipped" } },
-      ],
+      evidence: {
+        entries: [
+          { result: { status: "pass" } },
+          { result: { status: "fail" } },
+          { result: { status: "skipped" } },
+        ],
+      },
     };
 
     await expect(readSummary(summary, readQaSuiteFailedScenarioCountFromFile)).resolves.toBe(1);
@@ -372,7 +536,7 @@ describe("qa suite summary helpers", () => {
 
   it("rejects unsupported summary shapes", async () => {
     await expect(
-      readSummary({ counts: { total: 2 } }, readQaSuiteFailedScenarioCountFromFile),
+      readSummary({ counts: { total: 2, passed: 2 } }, readQaSuiteFailedScenarioCountFromFile),
     ).rejects.toThrow("did not include counts.failed");
     await expect(
       readSummary("not-json-object", readQaSuiteFailedScenarioCountFromFile),
@@ -420,7 +584,7 @@ describe("qa suite summary helpers", () => {
   it("fails summary files without a failure signal", async () => {
     const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), "qa-suite-summary-"));
     const summaryPath = path.join(outputDir, "qa-suite-summary.json");
-    await fs.writeFile(summaryPath, JSON.stringify({ counts: { total: 1 } }), "utf8");
+    await fs.writeFile(summaryPath, JSON.stringify({ counts: { total: 1, passed: 1 } }), "utf8");
 
     try {
       await expect(readQaSuiteFailedScenarioCountFromFile(summaryPath)).rejects.toThrow(

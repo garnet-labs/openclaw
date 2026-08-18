@@ -17,21 +17,13 @@ type MessageReceiptInputResult = MessageReceiptSourceResult & {
 function resolveReceiptMessageId(result: MessageReceiptInputResult): string | undefined {
   return (
     result.messageId ||
+    result.target?.id ||
     result.chatId ||
     result.channelId ||
     result.roomId ||
     result.conversationId ||
     result.toJid ||
     result.pollId
-  );
-}
-
-function hasNestedReceiptData(receipt: MessageReceipt | undefined): receipt is MessageReceipt {
-  return Boolean(
-    receipt &&
-    (receipt.parts.length > 0 ||
-      receipt.platformMessageIds.length > 0 ||
-      receipt.primaryPlatformMessageId),
   );
 }
 
@@ -51,7 +43,7 @@ export function createMessageReceiptFromOutboundResults(params: {
   sentAt?: number;
 }): MessageReceipt {
   const parts = params.results.flatMap((result, resultIndex) => {
-    if (hasNestedReceiptData(result.receipt)) {
+    if (result.receipt) {
       if (result.receipt.parts.length === 0) {
         return result.receipt.platformMessageIds.map((platformMessageId, partIndex) => ({
           platformMessageId,
@@ -90,7 +82,7 @@ export function createMessageReceiptFromOutboundResults(params: {
   });
   const platformMessageIds: string[] = [];
   for (const result of params.results) {
-    if (hasNestedReceiptData(result.receipt)) {
+    if (result.receipt) {
       appendUnique(platformMessageIds, result.receipt.primaryPlatformMessageId);
       for (const platformMessageId of result.receipt.platformMessageIds) {
         appendUnique(platformMessageIds, platformMessageId);
@@ -102,9 +94,7 @@ export function createMessageReceiptFromOutboundResults(params: {
     }
     appendUnique(platformMessageIds, resolveReceiptMessageId(result));
   }
-  const firstNestedReceipt = params.results.find((result) =>
-    hasNestedReceiptData(result.receipt),
-  )?.receipt;
+  const firstNestedReceipt = params.results.find((result) => result.receipt)?.receipt;
   return {
     ...(platformMessageIds[0] ? { primaryPlatformMessageId: platformMessageIds[0] } : {}),
     platformMessageIds,

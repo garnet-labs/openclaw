@@ -3,8 +3,14 @@
 // Package executable entrypoint that forwards to the CLI bootstrap.
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { formatCliFailureLines } from "./cli/failure-output.js";
+import {
+  formatCliFailureLines,
+  formatCliJsonFailure,
+  isExpectedCliError,
+} from "./cli/failure-output.js";
+import { isJsonOutputModeActive } from "./cli/json-output-mode.js";
 import { runCliWithExitFinalization } from "./cli/one-shot-exit.js";
+import { tryHandleRootVersionFastPath } from "./entry.version-fast-path.js";
 import { formatUncaughtError } from "./infra/errors.js";
 import { runFatalErrorHooks } from "./infra/fatal-error-hooks.js";
 import { isMainModule } from "./infra/is-main.js";
@@ -70,6 +76,7 @@ export async function runLegacyCliEntry(
 const isMain = isMainModule({
   currentFile: fileURLToPath(import.meta.url),
 });
+const handledRootVersion = isMain && tryHandleRootVersionFastPath(process.argv);
 
 if (!isMain) {
   ({
@@ -96,8 +103,8 @@ if (!isMain) {
   } = await import("./library.js"));
 }
 
-if (isMain) {
-  const { restoreTerminalState } = await import("../packages/terminal-core/src/restore.js");
+if (isMain && !handledRootVersion) {
+  const { defaultRuntime, restoreRuntimeTerminalState } = await import("./runtime.js");
 
   // Global error handlers to prevent silent crashes from unhandled rejections/exceptions.
   // These log the error and exit gracefully instead of crashing without trace.
@@ -114,6 +121,9 @@ if (isMain) {
       );
       return;
     }
+    if (isJsonOutputModeActive(process.argv)) {
+      defaultRuntime.writeJson(formatCliJsonFailure(error));
+    }
     for (const line of formatCliFailureLines({
       title: "OpenClaw hit an unexpected runtime error.",
       error,
@@ -124,7 +134,7 @@ if (isMain) {
     for (const message of runFatalErrorHooks({ reason: "uncaught_exception", error })) {
       console.error("[openclaw]", message);
     }
-    restoreTerminalState("uncaught exception", { resumeStdinIfPaused: false });
+    restoreRuntimeTerminalState("uncaught exception", { resumeStdinIfPaused: false });
     process.exit(1);
   });
 
@@ -135,6 +145,9 @@ if (isMain) {
         retainConsoleRoutingUntilProcessExit: true,
       }),
     onError: (err) => {
+      if (isJsonOutputModeActive(process.argv)) {
+        defaultRuntime.writeJson(formatCliJsonFailure(err));
+      }
       for (const line of formatCliFailureLines({
         title: "The CLI command failed.",
         error: err,
@@ -142,10 +155,12 @@ if (isMain) {
       })) {
         console.error(line);
       }
-      for (const message of runFatalErrorHooks({ reason: "legacy_cli_failure", error: err })) {
-        console.error("[openclaw]", message);
+      if (!isExpectedCliError(err)) {
+        for (const message of runFatalErrorHooks({ reason: "legacy_cli_failure", error: err })) {
+          console.error("[openclaw]", message);
+        }
       }
-      restoreTerminalState("legacy cli failure", { resumeStdinIfPaused: false });
+      restoreRuntimeTerminalState("legacy cli failure", { resumeStdinIfPaused: false });
       process.exitCode = 1;
     },
   });

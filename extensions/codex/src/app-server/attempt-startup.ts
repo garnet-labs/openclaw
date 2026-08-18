@@ -8,7 +8,7 @@ import {
   formatErrorMessage,
   type AgentHarnessRuntimeArtifactBinding,
   type CodexBundleMcpThreadConfig,
-  type EmbeddedRunAttemptParams,
+  type EmbeddedRunAttemptParamsV2 as EmbeddedRunAttemptParams,
   type resolveSandboxContext,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import {
@@ -67,6 +67,7 @@ import {
   releaseCodexSandboxExecServerEnvironment,
   type CodexSandboxExecEnvironment,
 } from "./sandbox-exec-server.js";
+import { buildScheduledCodexAppAuthorityInputFingerprint } from "./scheduled-app-authority.js";
 import type { CodexAppServerBindingStore } from "./session-binding.js";
 import {
   clearSharedCodexAppServerClientIfCurrent,
@@ -143,6 +144,8 @@ export async function startCodexAttemptThread(params: {
   startupEnvApiKeyCacheKey: string | undefined;
   agentDir: string;
   config: EmbeddedRunAttemptParams["config"] | undefined;
+  shellEnvironment?: Readonly<Record<string, string>>;
+  disableLoginShell?: boolean;
   buildAttemptParams: () => EmbeddedRunAttemptParams;
   sessionAgentId: string;
   effectiveWorkspace: string;
@@ -155,6 +158,8 @@ export async function startCodexAttemptThread(params: {
   buildFinalConfigPatch?: Parameters<typeof startOrResumeThread>[0]["buildFinalConfigPatch"];
   nativeHookRelayGeneration?: string;
   bundleMcpThreadConfig: CodexBundleMcpThreadConfig;
+  /** OpenClaw owns configured MCP dynamically for this scheduled turn. */
+  configuredMcpOwnershipVersion?: 1;
   nativeToolSurfaceEnabled: boolean;
   nativeProviderWebSearchSupport: CodexNativeWebSearchSupport;
   sandboxExecServerEnabled: boolean;
@@ -195,11 +200,14 @@ export async function startCodexAttemptThread(params: {
       },
       operation: async () => {
         const threadConfig = mergeCodexThreadConfigs(
-          params.bundleMcpThreadConfig?.configPatch as JsonObject | undefined,
+          params.configuredMcpOwnershipVersion === 1
+            ? undefined
+            : (params.bundleMcpThreadConfig?.configPatch as JsonObject | undefined),
         );
         const pluginStartupPolicy = resolveCodexPluginThreadConfigStartupPolicy({
           pluginConfig: params.pluginConfig,
           nativeToolSurfaceEnabled: params.nativeToolSurfaceEnabled,
+          scheduledRuntimeAuthority: params.buildAttemptParams().scheduledRuntimeAuthority,
         });
         const {
           pluginThreadConfigRequired,
@@ -242,6 +250,7 @@ export async function startCodexAttemptThread(params: {
                       : {}),
                   }
                 : {}),
+              agentId: params.sessionAgentId,
               agentDir: params.agentDir,
               config: params.config,
               onStartedClient: (client) => {
@@ -330,7 +339,7 @@ export async function startCodexAttemptThread(params: {
               }
               throw new AgentHarnessPreflightError(
                 `Codex Computer Use readiness failed: ${formatErrorMessage(error)}`,
-                { cause: error },
+                { cause: error, scope: "harness" },
               );
             }
             const startupRuntimeIdentity = activeStartupClient.getRuntimeIdentity();
@@ -348,11 +357,17 @@ export async function startCodexAttemptThread(params: {
               appServerVersion: activeStartupClient.getServerVersion(),
               runtimeIdentity: startupRuntimeIdentity,
             });
-            const pluginThreadConfigInputFingerprint = pluginThreadConfigRequired
+            const basePluginThreadConfigInputFingerprint = pluginThreadConfigRequired
               ? buildCodexPluginThreadConfigInputFingerprint({
                   pluginConfig: pluginThreadConfigPluginConfig,
                   appCacheKey: pluginAppCacheKey,
                 })
+              : undefined;
+            const pluginThreadConfigInputFingerprint = basePluginThreadConfigInputFingerprint
+              ? buildScheduledCodexAppAuthorityInputFingerprint(
+                  basePluginThreadConfigInputFingerprint,
+                  attemptParams.scheduledRuntimeAuthority,
+                )
               : undefined;
             embeddedAgentLog.debug(
               "codex plugin thread config eligibility",
@@ -377,11 +392,12 @@ export async function startCodexAttemptThread(params: {
             };
             releaseStartupResourcesOnTimeout = releaseStartupSandboxEnvironment;
             try {
-              startupSandboxEnvironment = shouldRequireCodexSandboxExecServerEnvironment({
+              const sandboxEnvironmentRequired = shouldRequireCodexSandboxExecServerEnvironment({
                 sandbox: params.sandbox,
                 nativeToolSurfaceEnabled: params.nativeToolSurfaceEnabled,
                 sandboxExecServerEnabled: params.sandboxExecServerEnabled,
-              })
+              });
+              startupSandboxEnvironment = sandboxEnvironmentRequired
                 ? await ensureCodexSandboxExecServerEnvironment({
                     client: activeStartupClient,
                     sandbox: params.sandbox ?? null,
@@ -395,12 +411,7 @@ export async function startCodexAttemptThread(params: {
                 await releaseStartupSandboxEnvironment();
                 throw new CodexAppServerStartupError("aborted");
               }
-              if (
-                params.sandbox?.enabled &&
-                params.nativeToolSurfaceEnabled &&
-                params.sandboxExecServerEnabled &&
-                !startupSandboxEnvironment
-              ) {
+              if (sandboxEnvironmentRequired && !startupSandboxEnvironment) {
                 throw new Error(
                   "Codex app-server did not register an OpenClaw sandbox exec-server environment.",
                 );
@@ -439,7 +450,6 @@ export async function startCodexAttemptThread(params: {
               }
               startupReservation = turnRouter.reserveThread({
                 threadId,
-                releaseOn: params.signal,
               });
               return { release: releaseStartupReservation };
             };
@@ -465,15 +475,26 @@ export async function startCodexAttemptThread(params: {
                 appServer: pluginAppServer,
                 developerInstructions: params.developerInstructions,
                 config: threadConfig,
+                shellEnvironment: params.shellEnvironment,
+                disableLoginShell: params.disableLoginShell,
                 finalConfigPatch: params.finalConfigPatch,
                 buildFinalConfigPatch: params.buildFinalConfigPatch,
                 nativeHookRelayGeneration: params.nativeHookRelayGeneration,
                 nativeCodeModeEnabled: params.nativeToolSurfaceEnabled,
                 nativeProviderWebSearchSupport: params.nativeProviderWebSearchSupport,
                 nativeCodeModeOnlyEnabled: params.appServer.codeModeOnly,
-                userMcpServersEnabled: params.nativeToolSurfaceEnabled,
-                mcpServersFingerprint: params.bundleMcpThreadConfig.fingerprint,
-                mcpServersFingerprintEvaluated: params.bundleMcpThreadConfig.evaluated,
+                userMcpServersEnabled:
+                  params.configuredMcpOwnershipVersion === 1
+                    ? false
+                    : params.nativeToolSurfaceEnabled,
+                mcpServersFingerprint:
+                  params.configuredMcpOwnershipVersion === 1
+                    ? undefined
+                    : params.bundleMcpThreadConfig.fingerprint,
+                mcpServersFingerprintEvaluated:
+                  params.configuredMcpOwnershipVersion === 1 ||
+                  params.bundleMcpThreadConfig.evaluated,
+                configuredMcpOwnershipVersion: params.configuredMcpOwnershipVersion,
                 environmentSelection: startupEnvironmentSelection,
                 appServerRuntimeFingerprint,
                 contextEngineProjection: params.contextEngineProjection,
@@ -489,6 +510,7 @@ export async function startCodexAttemptThread(params: {
                       client: activeStartupClient,
                       configCwd: startupExecutionCwd,
                       appCacheKey: pluginAppCacheKey,
+                      scheduledRuntimeAuthority: attemptParams.scheduledRuntimeAuthority,
                     })
                   : undefined,
               }) satisfies Parameters<typeof startOrResumeThread>[0];
@@ -706,11 +728,5 @@ function shouldClearSharedClientAfterStartupFailure(params: {
   error: unknown;
   spawnedBy: EmbeddedRunAttemptParams["spawnedBy"];
 }): boolean {
-  if (!(params.error instanceof Error)) {
-    return !params.spawnedBy;
-  }
-  if (isCodexAppServerBrokenPipeError(params.error)) {
-    return true;
-  }
-  return !params.spawnedBy;
+  return isCodexAppServerBrokenPipeError(params.error) || !params.spawnedBy;
 }
