@@ -67,6 +67,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN_DEV }}
+          api_url: https://dev-api.garnet.ai
+
       - name: Prepare trusted workflow audit configs
         if: github.event_name == 'pull_request'
         env:
