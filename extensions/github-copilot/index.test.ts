@@ -20,9 +20,9 @@ import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import type { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { runGitHubCopilotDeviceFlow } from "./login.js";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
 
 const mocks = vi.hoisted(() => ({
-  githubCopilotLoginCommand: vi.fn(),
   fetchWithSsrFGuard: vi.fn<typeof fetchWithSsrFGuard>(async (params) => ({
     response: await fetch(params.url, params.init),
     finalUrl: params.url,
@@ -50,19 +50,17 @@ vi.mock("./register.runtime.js", () => ({
   DEFAULT_COPILOT_API_BASE_URL: "https://api.githubcopilot.test",
   resolveCopilotRuntimeAuth: mocks.resolveCopilotRuntimeAuth,
   resolveCopilotStarterModel: mocks.resolveCopilotStarterModel,
-  githubCopilotLoginCommand: mocks.githubCopilotLoginCommand,
   fetchCopilotUsage: vi.fn(),
 }));
 
 import plugin from "./index.js";
 
 const tempDirs: string[] = [];
-type RegisteredMemoryEmbeddingProvider = Parameters<
-  OpenClawPluginApi["registerMemoryEmbeddingProvider"]
->[0];
+type RegisteredEmbeddingProvider = Parameters<OpenClawPluginApi["registerEmbeddingProvider"]>[0];
 type RegisteredProvider = Parameters<OpenClawPluginApi["registerProvider"]>[0];
 type GithubCopilotTestProvider = RegisteredProvider & {
   auth: Array<{
+    id: string;
     run: (ctx: unknown) => Promise<ProviderAuthResult | null>;
     runNonInteractive: (ctx: unknown) => Promise<OpenClawConfig | null>;
   }>;
@@ -190,6 +188,80 @@ describe("github-copilot plugin", () => {
     ).toBe("durable-github-token");
   });
 
+  it("normalizes legacy OAuth profiles without losing tenant metadata", async () => {
+    const provider = registerProviderWithPluginConfig({});
+    const credential = {
+      type: "oauth" as const,
+      provider: "github-copilot",
+      access: "short-lived-copilot-token",
+      refresh: "durable-github-token",
+      expires: 1,
+      enterpriseUrl: "acme.ghe.com",
+    };
+
+    await expect(provider.refreshOAuth?.(credential)).resolves.toEqual({
+      ...credential,
+      access: "durable-github-token",
+      expires: MAX_DATE_TIMESTAMP_MS,
+    });
+    expect(credential).toEqual({
+      type: "oauth",
+      provider: "github-copilot",
+      access: "short-lived-copilot-token",
+      refresh: "durable-github-token",
+      expires: 1,
+      enterpriseUrl: "acme.ghe.com",
+    });
+  });
+
+  it("rejects unsafe legacy OAuth tenants before formatting or refresh", async () => {
+    const provider = registerProviderWithPluginConfig({});
+    const credential = {
+      type: "oauth" as const,
+      provider: "github-copilot",
+      access: "short-lived-copilot-token",
+      refresh: "durable-github-token",
+      expires: 1,
+      enterpriseUrl: "attacker.example",
+    };
+
+    expect(() => provider.formatApiKey?.(credential)).toThrow(/attacker\.example/);
+    await expect(provider.refreshOAuth?.(credential)).rejects.toThrow(/attacker\.example/);
+  });
+
+  it("moves unsupported legacy OAuth doctor guidance into the provider", async () => {
+    const provider = registerProviderWithPluginConfig({});
+    const store = {
+      version: 1,
+      profiles: {
+        "github-copilot:default": {
+          type: "oauth" as const,
+          provider: "github-copilot",
+          access: "fake",
+          refresh: "fake",
+          expires: 0,
+          enterpriseUrl: "attacker.example",
+        },
+      },
+    };
+
+    expect(
+      await provider.buildAuthDoctorHint?.({
+        store,
+        provider: "github-copilot",
+        profileId: "github-copilot:default",
+      }),
+    ).toContain("unsupported enterprise domain");
+    store.profiles["github-copilot:default"].enterpriseUrl = "acme.ghe.com";
+    expect(
+      await provider.buildAuthDoctorHint?.({
+        store,
+        provider: "github-copilot",
+        profileId: "github-copilot:default",
+      }),
+    ).toBeUndefined();
+  });
+
   it("preserves the source token supplied by the auth layer for runtime auth", async () => {
     mocks.resolveCopilotRuntimeAuth.mockResolvedValueOnce({
       apiKey: "github-source-token",
@@ -225,6 +297,38 @@ describe("github-copilot plugin", () => {
           "User-Agent": "GitHubCopilotChat/0.35.0",
         },
       },
+    });
+  });
+
+  it("carries a legacy OAuth tenant into request-time routing", async () => {
+    mocks.resolveCopilotRuntimeAuth.mockResolvedValueOnce({
+      apiKey: "durable-github-token",
+      baseUrl: "https://copilot-api.acme.ghe.com",
+    });
+    const provider = registerProviderWithPluginConfig({});
+    const apiKey = provider.formatApiKey?.({
+      type: "oauth",
+      provider: "github-copilot",
+      access: "short-lived-copilot-token",
+      refresh: "durable-github-token",
+      expires: MAX_DATE_TIMESTAMP_MS,
+      enterpriseUrl: "acme.ghe.com",
+    });
+
+    await provider.prepareRuntimeAuth({
+      config: {},
+      env: {},
+      provider: "github-copilot",
+      modelId: "gpt-5-mini",
+      model: { id: "gpt-5-mini", provider: "github-copilot" },
+      apiKey,
+      authMode: "oauth",
+    } as never);
+
+    expect(mocks.resolveCopilotRuntimeAuth).toHaveBeenCalledWith({
+      githubToken: "durable-github-token",
+      env: {},
+      githubDomain: "acme.ghe.com",
     });
   });
 
@@ -264,8 +368,7 @@ describe("github-copilot plugin", () => {
   });
 
   it("registers embedding provider", () => {
-    const registerMemoryEmbeddingProviderMock =
-      vi.fn<OpenClawPluginApi["registerMemoryEmbeddingProvider"]>();
+    const registerEmbeddingProviderMock = vi.fn<OpenClawPluginApi["registerEmbeddingProvider"]>();
 
     plugin.register(
       createTestPluginApi({
@@ -276,14 +379,14 @@ describe("github-copilot plugin", () => {
         pluginConfig: {},
         runtime: {} as never,
         registerProvider: vi.fn(),
-        registerMemoryEmbeddingProvider: registerMemoryEmbeddingProviderMock,
+        registerEmbeddingProvider: registerEmbeddingProviderMock,
       }),
     );
 
-    expect(registerMemoryEmbeddingProviderMock).toHaveBeenCalledTimes(1);
-    const adapter = requireFirstMockArg<RegisteredMemoryEmbeddingProvider>(
-      registerMemoryEmbeddingProviderMock,
-      "memory embedding provider registration",
+    expect(registerEmbeddingProviderMock).toHaveBeenCalledTimes(1);
+    const adapter = requireFirstMockArg<RegisteredEmbeddingProvider>(
+      registerEmbeddingProviderMock,
+      "embedding provider registration",
     );
     expect(adapter.id).toBe("github-copilot");
   });
@@ -557,7 +660,6 @@ describe("github-copilot plugin", () => {
       message: "GitHub Copilot auth already exists. Re-run login?",
       initialValue: false,
     });
-    expect(mocks.githubCopilotLoginCommand).not.toHaveBeenCalled();
     expect(result).toEqual({
       profiles: [
         {
@@ -906,7 +1008,6 @@ describe("github-copilot plugin", () => {
         message: "GitHub Copilot auth already exists. Re-run login?",
         initialValue: false,
       });
-      expect(mocks.githubCopilotLoginCommand).not.toHaveBeenCalled();
       if (!result) {
         throw new Error("Expected GitHub Copilot auth result");
       }
@@ -1181,7 +1282,6 @@ describe("github-copilot plugin", () => {
       message: "GitHub Copilot auth already exists. Re-run login?",
       initialValue: false,
     });
-    expect(mocks.githubCopilotLoginCommand).not.toHaveBeenCalled();
     expect(result.profiles[0]?.credential).toEqual({
       type: "token",
       provider: "github-copilot",
@@ -1343,23 +1443,46 @@ describe("github-copilot plugin", () => {
   it("stores GitHub Copilot token from non-interactive onboarding", async () => {
     const provider = registerProviderWithPluginConfig({});
     const method = requireAuthMethod(provider.auth, 0);
+    const choice = expectDefined(
+      manifest.providerAuthChoices.find((entry) => entry.choiceId === "github-copilot"),
+      "GitHub Copilot manifest auth choice",
+    );
+    const optionKey = expectDefined(choice.optionKey, "GitHub Copilot option key");
+    const setupProvider = expectDefined(
+      manifest.setup.providers.find((entry) => entry.id === choice.provider),
+      "GitHub Copilot setup provider",
+    );
+    const envVar = expectDefined(setupProvider.envVars[0], "GitHub Copilot setup env var");
     const agentDir = await createAgentDir();
     const runtime = { error: vi.fn(), exit: vi.fn() };
+    const resolveApiKey = vi.fn(async () => ({
+      key: "ghu_test123",
+      source: "flag" as const,
+    }));
 
     const result = await method.runNonInteractive({
-      authChoice: "github-copilot",
+      authChoice: choice.choiceId,
       config: {},
       baseConfig: {},
-      opts: { githubCopilotToken: "ghu_test\r\n123" },
+      opts: { [optionKey]: "ghu_test\r\n123" },
       runtime,
       agentDir,
-      resolveApiKey: vi.fn(async () => ({
-        key: "ghu_test123",
-        source: "flag" as const,
-      })),
+      resolveApiKey,
       toApiKeyCredential: vi.fn(),
     });
 
+    expect(provider.id).toBe(choice.provider);
+    expect(method.id).toBe(choice.method);
+    expect(provider.envVars).toEqual(setupProvider.envVars);
+    expect(resolveApiKey).toHaveBeenCalledWith({
+      provider: choice.provider,
+      flagValue: "ghu_test123",
+      flagName: choice.cliFlag,
+      envVar,
+      envVarName: envVar,
+      allowProfile: false,
+      required: false,
+    });
     expect(runtime.error).not.toHaveBeenCalled();
     expect(result?.auth?.profiles?.["github-copilot:github"]).toEqual({
       provider: "github-copilot",

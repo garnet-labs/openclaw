@@ -77,6 +77,7 @@ describe("worktree run lease", () => {
     const created = await service.create({
       repoRoot: repo,
       name: "run-lease-session",
+      baseRef: "HEAD",
       ownerKind: "session",
       ownerId: "agent:main:run-lease",
     });
@@ -99,6 +100,30 @@ describe("worktree run lease", () => {
 
     await child.release();
     expect(await lockState(record!)).toEqual({ kind: "none" });
+    expect(hasLiveWorktreeRunLease(env, created.id)).toBe(false);
+  });
+
+  it("rejects admission when the linked Git admin directory is missing", async () => {
+    const created = await createSessionWorktree();
+    const knownFile = path.join(created.path, "README.md");
+    const gitAdminDir = await git(created.path, "rev-parse", "--absolute-git-dir");
+    const displacedGitAdminDir = path.join(root, "git-admin-aside");
+    await fs.rename(gitAdminDir, displacedGitAdminDir);
+
+    try {
+      const acquisition = acquireWorktreeRunLease(created.id, { env });
+      await expect(acquisition).rejects.toThrow(
+        `managed worktree is unusable because its Git removal guard could not be acquired: ${created.path}`,
+      );
+      await expect(acquisition).rejects.toMatchObject({ cause: expect.any(Error) });
+      expect(hasLiveWorktreeRunLease(env, created.id)).toBe(false);
+      expect(await fs.readFile(knownFile, "utf8")).toBe("base\n");
+    } finally {
+      await fs.rename(displacedGitAdminDir, gitAdminDir);
+    }
+
+    const lease = await acquireWorktreeRunLease(created.id, { env });
+    await lease.release();
     expect(hasLiveWorktreeRunLease(env, created.id)).toBe(false);
   });
 

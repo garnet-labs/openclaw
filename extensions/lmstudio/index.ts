@@ -1,6 +1,8 @@
+import { adaptMemoryEmbeddingProviderAdapter } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
 // Lmstudio plugin entrypoint registers its OpenClaw integration.
 import {
   definePluginEntry,
+  type OpenClawConfig,
   type OpenClawPluginApi,
   type ProviderAuthContext,
   type ProviderAuthMethod,
@@ -8,7 +10,6 @@ import {
   type ProviderAuthResult,
   type ProviderRuntimeModel,
 } from "openclaw/plugin-sdk/plugin-entry";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import {
   CUSTOM_LOCAL_AUTH_MARKER,
   normalizeOptionalSecretInput,
@@ -25,6 +26,7 @@ import {
 import {
   normalizeLmstudioConfiguredCatalogEntries,
   normalizeLmstudioProviderConfig,
+  resolveLoadedContextWindow,
   resolveLmstudioInferenceBase,
 } from "./src/models.js";
 import { shouldUseLmstudioSyntheticAuth } from "./src/provider-auth.js";
@@ -82,23 +84,39 @@ async function validateLmstudioNonInteractive(
     return false;
   }
 
-  const availableModels = discovery.models
+  const installedModels = discovery.models
     .filter((model) => model.type === "llm")
+    .map((model) => model.key?.trim())
+    .filter((model): model is string => Boolean(model));
+  const loadedModels = discovery.models
+    .filter(
+      (model) =>
+        model.type === "llm" &&
+        Boolean(model.key?.trim()) &&
+        resolveLoadedContextWindow(model) !== null,
+    )
     .map((model) => model.key?.trim())
     .filter((model): model is string => Boolean(model));
   // Setup matches the requested wire key unchanged. Accepting provider-
   // qualified refs here would permit reset before setup rejects the model.
   const requestedModel = normalizeOptionalSecretInput(ctx.opts.customModelId);
-  if (requestedModel && !availableModels.includes(requestedModel)) {
+  if (requestedModel && !installedModels.includes(requestedModel)) {
     ctx.runtime.error(
-      `LM Studio model ${requestedModel} was not found at ${baseUrl}.\nAvailable models: ${availableModels.join(", ")}`,
+      `LM Studio model ${requestedModel} was not found at ${baseUrl}.\nAvailable models: ${installedModels.join(", ")}`,
     );
     ctx.runtime.exit(1);
     return false;
   }
-  if (availableModels.length === 0) {
+  if (requestedModel && !loadedModels.includes(requestedModel)) {
     ctx.runtime.error(
-      `No LM Studio LLM models were found at ${baseUrl}.\nLoad at least one model in LM Studio (or run lms load), then re-run setup.`,
+      `LM Studio model ${requestedModel} is installed but not loaded at ${baseUrl}.\nLoad that model in LM Studio, then re-run setup.`,
+    );
+    ctx.runtime.exit(1);
+    return false;
+  }
+  if (loadedModels.length === 0) {
+    ctx.runtime.error(
+      `No loaded LM Studio LLM models were found at ${baseUrl}.\nLoad a model in LM Studio (or run lms load <model>), then re-run setup.`,
     );
     ctx.runtime.exit(1);
     return false;
@@ -135,7 +153,9 @@ export default definePluginEntry({
   name: "LM Studio Provider",
   description: "Bundled LM Studio provider plugin",
   register(api: OpenClawPluginApi) {
-    api.registerMemoryEmbeddingProvider(lmstudioMemoryEmbeddingProviderAdapter);
+    api.registerEmbeddingProvider(
+      adaptMemoryEmbeddingProviderAdapter(lmstudioMemoryEmbeddingProviderAdapter),
+    );
     api.registerProvider({
       id: PROVIDER_ID,
       label: "LM Studio",

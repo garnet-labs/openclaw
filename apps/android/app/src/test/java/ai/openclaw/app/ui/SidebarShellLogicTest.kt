@@ -118,27 +118,9 @@ class SidebarShellLogicTest {
             session("archived", activity = 50, archived = true),
             session("fresh-pinned", activity = 20, pinned = true),
           ),
-        query = "",
       )
 
     assertEquals(listOf("fresh-pinned", "old-pinned", "fresh"), rows.map(ChatSessionEntry::key))
-  }
-
-  @Test
-  fun recentSessionSearchCoversTitleLabelKeyAndOwnerBeforeApplyingLimit() {
-    val rows =
-      sidebarRecentSessions(
-        sessions =
-          listOf(
-            session("agent:ops:one", activity = 1, displayName = "Release planning", owner = "ops"),
-            session("agent:main:two", activity = 2, displayName = "Product notes", owner = "main"),
-            session("agent:main:three", activity = 3, label = "Ops handoff", owner = "main"),
-          ),
-        query = "ops",
-        limit = 1,
-      )
-
-    assertEquals(listOf("agent:main:three"), rows.map(ChatSessionEntry::key))
   }
 
   @Test
@@ -146,10 +128,23 @@ class SidebarShellLogicTest {
     val rows =
       sidebarRecentSessions(
         sessions = (1L..12L).map { activity -> session("session-$activity", activity = activity) },
-        query = "",
       )
 
     assertEquals(8, rows.size)
+  }
+
+  @Test
+  fun sessionSubtitleShowsWorkingForActiveRunsAndKeepsTheIdleSourceFallback() {
+    val session = ChatSessionEntry(key = "telegram:123", updatedAtMs = 1_000, hasActiveRun = true)
+
+    assertEquals(
+      "Working",
+      sidebarSessionSubtitle(session, activeRunLabel = "Working", nowMs = 1_000),
+    )
+    assertEquals(
+      "Telegram",
+      sidebarSessionSubtitle(session.copy(hasActiveRun = false), activeRunLabel = null, nowMs = 1_000),
+    )
   }
 
   private fun agent(

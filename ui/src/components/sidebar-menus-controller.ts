@@ -31,9 +31,11 @@ import type { SidebarWorkboardBoard, SidebarWorkboardRenderers } from "./app-sid
 import type { SessionDataController } from "./session-data-controller.ts";
 import { fetchSessionMenuWork } from "./session-menu-work.ts";
 import type { SessionMenuWork } from "./session-menu.ts";
-import type { SessionOrganizerController } from "./session-organizer-controller.ts";
-import type { SessionOrganizerControllerHost } from "./session-organizer-operations.runtime.ts";
-import type { SessionCreatorOption } from "./session-owner-chip.ts";
+import type {
+  SessionOrganizerController,
+  SessionOrganizerControllerHost,
+} from "./session-organizer-controller.ts";
+import type { SessionOwnerOption } from "./session-owner-chip.ts";
 
 type SidebarMenuAgent = {
   id: string;
@@ -48,7 +50,7 @@ interface SidebarMenusControllerState {
   sessionMenuWork: SessionMenuWork | null;
   sessionGroupMenu: SidebarSessionGroupMenuState | null;
   sessionSortMenuPosition: { x: number; y: number } | null;
-  catalogViewMenuPosition: { x: number; y: number } | null;
+  catalogViewMenuPosition: { catalogId: string; x: number; y: number } | null;
   agentMenuPosition: { x: number; top: number } | null;
   agentMenuFilter: string;
   identityMenuPosition: { x: number; bottom: number; width: number } | null;
@@ -84,6 +86,7 @@ export interface SidebarMenusControllerHost
   readonly onUpdateSidebarEntries?: (entries: string[]) => void;
   readonly onPreloadRoute?: (routeId: NavigationRouteId) => Promise<void>;
   readonly pinnedAgentIds: readonly string[];
+  readonly preferencesBrowserOnly: boolean;
   readonly selectedSessionKeys: ReadonlySet<string>;
   readonly sessionData: SessionOrganizerControllerHost["sessionData"] &
     Pick<
@@ -94,12 +97,22 @@ export interface SidebarMenusControllerHost
   readonly sessionOrganizer: SessionOrganizerController;
   readonly sessionCreatorFilterActive: boolean;
   sessionCreatorFilterId: string | null;
-  readonly sessionCreatorOptions: readonly SessionCreatorOption[];
+  sessionInvolvingMeFilterActive: boolean;
+  readonly sessionCreatorOptions: readonly SessionOwnerOption[];
   readonly sessionOwnershipVisible: boolean;
+  readSessionMutationAccess(request: {
+    method: string;
+    params?: unknown;
+    requiredScope?: "operator.write" | "operator.admin";
+  }): import("../lib/session-method-access.ts").SessionMethodAccess;
   readonly sidebarEntries: readonly string[];
   readonly catalogProjectGrouping: CatalogProjectGrouping;
   setCatalogProjectGrouping(grouping: CatalogProjectGrouping): void;
+  hideSessionCatalog(catalogId: string): void;
   sessionSortMode: SidebarSessionSortMode;
+  effectiveSessionSortMode(): SidebarSessionSortMode;
+  sessionPeopleSortAvailable(): boolean;
+  setSessionSortMode(mode: SidebarSessionSortMode): void;
   readonly terminalAvailable: boolean;
   readonly themeMode: ThemeMode;
   readonly workboardBoards: readonly SidebarWorkboardBoard[];
@@ -132,7 +145,7 @@ export class SidebarMenusController implements ReactiveController, SidebarMenusC
   sessionMenuWork: SessionMenuWork | null = null;
   sessionGroupMenu: SidebarSessionGroupMenuState | null = null;
   sessionSortMenuPosition: { x: number; y: number } | null = null;
-  catalogViewMenuPosition: { x: number; y: number } | null = null;
+  catalogViewMenuPosition: { catalogId: string; x: number; y: number } | null = null;
   agentMenuPosition: { x: number; top: number } | null = null;
   agentMenuFilter = "";
   // Anchored by its bottom edge so the footer menu grows upward regardless of height.
@@ -420,20 +433,25 @@ export class SidebarMenusController implements ReactiveController, SidebarMenusC
     });
   }
 
-  toggleCatalogViewMenu(trigger: HTMLElement) {
-    if (this.catalogViewMenuPosition) {
+  toggleCatalogViewMenu(catalogId: string, trigger: HTMLElement) {
+    if (this.catalogViewMenuPosition?.catalogId === catalogId) {
       this.closeCatalogViewMenu();
       return;
     }
+    const rect = trigger.getBoundingClientRect();
+    this.openCatalogViewMenu(catalogId, rect.right, rect.bottom + 4, trigger);
+  }
+
+  openCatalogViewMenu(catalogId: string, x: number, y: number, trigger: HTMLElement | null = null) {
     this.loadMenuRenderer();
     const menuWidth = 200;
-    const menuMaxHeight = 120;
-    const rect = trigger.getBoundingClientRect();
+    const menuMaxHeight = 360;
     this.dismissTransientMenus();
     this.catalogViewMenuTrigger = trigger;
     this.updateState("catalogViewMenuPosition", {
-      x: Math.max(8, Math.min(rect.right, window.innerWidth - menuWidth - 8)),
-      y: Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - menuMaxHeight - 8)),
+      catalogId,
+      x: Math.max(8, Math.min(x, window.innerWidth - menuWidth - 8)),
+      y: Math.max(8, Math.min(y, window.innerHeight - menuMaxHeight - 8)),
     });
   }
 

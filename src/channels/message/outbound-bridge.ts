@@ -67,6 +67,7 @@ function resolveResultMessageId(result: ChannelMessageOutboundBridgeResult): str
     result.messageId ??
     result.receipt?.primaryPlatformMessageId ??
     result.receipt?.platformMessageIds[0] ??
+    result.target?.id ??
     result.chatId ??
     result.channelId ??
     result.roomId ??
@@ -101,6 +102,17 @@ function toMessageSendResult(
         replyToId: params.replyToId ?? undefined,
       });
   return {
+    // Preserve sanctioned owner facts for delivery hooks without exposing private
+    // provider fields or trusting a provider-authored channel identity.
+    ...(result.target !== undefined ? { target: result.target } : {}),
+    ...(result.chatId !== undefined ? { chatId: result.chatId } : {}),
+    ...(result.channelId !== undefined ? { channelId: result.channelId } : {}),
+    ...(result.roomId !== undefined ? { roomId: result.roomId } : {}),
+    ...(result.conversationId !== undefined ? { conversationId: result.conversationId } : {}),
+    ...(result.toJid !== undefined ? { toJid: result.toJid } : {}),
+    ...(result.pollId !== undefined ? { pollId: result.pollId } : {}),
+    ...(result.timestamp !== undefined ? { timestamp: result.timestamp } : {}),
+    ...(result.meta !== undefined ? { meta: result.meta } : {}),
     receipt,
     ...(resolveResultMessageId({ ...result, receipt })
       ? {

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { WORKBOARD_STATUSES } from "@openclaw/workboard-contract";
 import { MAX_DATE_TIMESTAMP_MS } from "openclaw/plugin-sdk/number-runtime";
 import { describe, expect, it, vi } from "vitest";
 import type {
@@ -146,7 +147,11 @@ describe("WorkboardStore", () => {
         subscriptions: stores.subscriptions,
         attachments: stores.attachments,
       });
-      const board = await store.upsertBoard({ id: "planning", name: "Planning" });
+      const board = await store.upsertBoard({
+        id: "planning",
+        name: "Planning",
+        automationJobId: "job-categorize-planning",
+      });
       const card = await store.create({
         title: "Persist it",
         boardId: board.id,
@@ -238,7 +243,11 @@ describe("WorkboardStore", () => {
       expect(await reopened.listBoards()).toMatchObject({
         boards: [
           expect.objectContaining({ id: "default" }),
-          expect.objectContaining({ id: board.id, name: "Planning" }),
+          expect.objectContaining({
+            id: board.id,
+            name: "Planning",
+            automationJobId: "job-categorize-planning",
+          }),
         ],
       });
       expect(await reopened.get(card.id)).toMatchObject({
@@ -276,6 +285,67 @@ describe("WorkboardStore", () => {
     }
   });
 
+  it("lists sqlite board summaries without hydrating card child rows", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-summary-"));
+    const dbPath = path.join(dir, "workboard.sqlite");
+    try {
+      let cardId = "";
+      const initialStores = createWorkboardSqliteStores({ dbPath });
+      try {
+        const initial = new WorkboardStore(initialStores.cards, {
+          boards: initialStores.boards,
+          subscriptions: initialStores.subscriptions,
+          attachments: initialStores.attachments,
+        });
+        await initial.upsertBoard({ id: "ops", name: "Ops" });
+        const card = await initial.create({ title: "Summarize me", boardId: "ops" });
+        cardId = card.id;
+        await initial.addComment(card.id, { body: "valid before corruption" });
+        const archived = await initial.create({
+          title: "Summarize archived card",
+          boardId: "ops",
+          status: "ready",
+        });
+        await initial.archive(archived.id, true);
+      } finally {
+        initialStores.close();
+      }
+
+      const rawDb = new DatabaseSync(dbPath);
+      try {
+        rawDb.prepare("UPDATE workboard_card_comments SET body = '' WHERE card_id = ?").run(cardId);
+      } finally {
+        rawDb.close();
+      }
+
+      const reopenedStores = createWorkboardSqliteStores({ dbPath });
+      try {
+        const reopened = new WorkboardStore(reopenedStores.cards, {
+          boards: reopenedStores.boards,
+          subscriptions: reopenedStores.subscriptions,
+          attachments: reopenedStores.attachments,
+        });
+        await expect(reopened.get(cardId)).rejects.toThrow(/missing body/);
+        await expect(reopened.listBoards()).resolves.toMatchObject({
+          boards: expect.arrayContaining([
+            expect.objectContaining({
+              id: "ops",
+              name: "Ops",
+              total: 2,
+              active: 1,
+              archived: 1,
+              byStatus: { ready: 1, todo: 1 },
+            }),
+          ]),
+        });
+      } finally {
+        reopenedStores.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("migrates a version 2 workboard table to STRICT without losing rows", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-strict-migration-"));
     const dbPath = path.join(dir, "workboard.sqlite");
@@ -301,7 +371,13 @@ describe("WorkboardStore", () => {
           updated_at INTEGER NOT NULL,
           archived_at INTEGER
         );
-        INSERT INTO workboard_boards SELECT * FROM workboard_boards_strict;
+        INSERT INTO workboard_boards (
+          id, name, description, icon, color, default_workspace_json, orchestration_json,
+          created_at, updated_at, archived_at
+        ) SELECT
+          id, name, description, icon, color, default_workspace_json, orchestration_json,
+          created_at, updated_at, archived_at
+        FROM workboard_boards_strict;
         DROP TABLE workboard_boards_strict;
         DELETE FROM workboard_schema_migrations WHERE id = 'schema-3';
         INSERT OR IGNORE INTO workboard_schema_migrations (id, applied_at)
@@ -359,6 +435,15 @@ describe("WorkboardStore", () => {
       statfs.mockRestore();
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it.each([
+    ["", "non-empty string"],
+    ["x".repeat(129), "128 characters or fewer"],
+  ])("rejects invalid automation job ids", async (automationJobId, message) => {
+    const store = new WorkboardStore(createMemoryStore());
+
+    await expect(store.upsertBoard({ id: "planning", automationJobId })).rejects.toThrow(message);
   });
 
   it("creates and lists cards by status order and position", async () => {
@@ -1008,6 +1093,24 @@ describe("WorkboardStore", () => {
     const restored = await store.archive(card.id, false);
     expect(restored.metadata?.archivedAt).toBeUndefined();
     expect(restored.events?.at(-1)).toMatchObject({ kind: "unarchived" });
+  });
+
+  it("ignores caller-supplied archivedAt on create so no card is born archived", async () => {
+    const store = new WorkboardStore(createMemoryStore());
+    const card = await store.create({
+      title: "Injected archive",
+      metadata: { archivedAt: Date.now() },
+    });
+
+    // Archival is a transition owned by archive(), which appends the matching
+    // event. Honouring it here would exclude the card from dispatch from birth
+    // with an event log recording only "created".
+    expect(card.metadata?.archivedAt).toBeUndefined();
+    expect(card.events?.map((event) => event.kind)).toEqual(["created"]);
+
+    const archived = await store.archive(card.id, true);
+    expect(archived.metadata?.archivedAt).toBeGreaterThan(0);
+    expect(archived.events?.at(-1)).toMatchObject({ kind: "archived" });
   });
 
   it("resolves matching unknown proof on completion without duplicating it", async () => {
@@ -2598,6 +2701,59 @@ describe("WorkboardStore", () => {
       ],
       count: 1,
     });
+  });
+
+  it.each(WORKBOARD_STATUSES)(
+    "reports archived %s cards according to terminal state",
+    async (status) => {
+      const store = new WorkboardStore(createMemoryStore());
+      const card = await store.create({ title: `Archived ${status}`, status });
+
+      await store.archive(card.id, true);
+
+      const result = await store.diagnostics(Date.now());
+      if (status === "done") {
+        expect(result).toEqual({ diagnostics: [], count: 0 });
+        return;
+      }
+      expect(result).toMatchObject({
+        diagnostics: [
+          expect.objectContaining({
+            card: expect.objectContaining({ id: card.id }),
+            diagnostics: [
+              expect.objectContaining({
+                kind: "archived_but_active",
+                severity: "warning",
+                actions: [],
+              }),
+            ],
+          }),
+        ],
+        count: 1,
+      });
+    },
+  );
+
+  it("keeps archived-card diagnostics transient across lifecycle changes", async () => {
+    const store = new WorkboardStore(createMemoryStore());
+    const card = await store.create({ title: "Archived but ready", status: "ready" });
+    const now = Date.now();
+
+    await store.archive(card.id, true);
+
+    await expect(store.refreshDiagnostics(now)).resolves.toEqual({ diagnostics: [], count: 0 });
+    await expect(store.get(card.id)).resolves.not.toHaveProperty("metadata.diagnostics");
+    await expect(store.diagnostics(now)).resolves.toMatchObject({
+      diagnostics: [expect.objectContaining({ card: expect.objectContaining({ id: card.id }) })],
+      count: 1,
+    });
+
+    await store.archive(card.id, false);
+    await expect(store.diagnostics(now + 1)).resolves.toEqual({ diagnostics: [], count: 0 });
+
+    await store.archive(card.id, true);
+    await store.move(card.id, "done", undefined);
+    await expect(store.diagnostics(now + 2)).resolves.toEqual({ diagnostics: [], count: 0 });
   });
 
   it("does not drop concurrent updates while refreshing diagnostics", async () => {

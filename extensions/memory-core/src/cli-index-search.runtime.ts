@@ -1,20 +1,18 @@
-import fsSync from "node:fs";
-import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { resolveMemorySearchStaleness } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { resolveMemoryDreamingConfig } from "openclaw/plugin-sdk/memory-core-host-status";
 import {
   buildCliMemorySearchSessionKey,
   formatAuditCounts,
   formatExtraPaths,
+  formatMemoryIndexOutcome,
   resolveMemoryPluginConfig,
+  scanMemoryManagerSources,
   withMemoryCommand,
-  type MemoryManager,
 } from "./cli-runtime-common.js";
 import {
   defaultRuntime,
   formatErrorMessage,
-  resolveStateDir,
   setVerbose,
   shortenHomeInString,
   shortenHomePath,
@@ -27,7 +25,6 @@ import type {
   MemoryPromoteExplainOptions,
   MemorySearchCommandOptions,
 } from "./cli.types.js";
-import { asRecord } from "./dreaming-shared.js";
 import { resolveShortTermPromotionDreamingConfig } from "./dreaming.js";
 import { formatMemoryVectorDegradedWriteReason } from "./memory/manager-vector-warning.js";
 import type { MemoryCoreRuntimeHost } from "./memory/runtime-host.js";
@@ -40,67 +37,16 @@ import {
   resolveShortTermRecallStorePath,
 } from "./short-term-promotion.js";
 const { accent, heading, info, muted, success, warn } = theme;
-function formatMemoryIndexIdentityWarning(
-  status: ReturnType<MemoryManager["status"]>,
-  agentId: string,
-): {
-  reason: string;
-  fix: string;
-} | null {
-  const indexIdentity = asRecord(asRecord(status.custom)?.indexIdentity);
-  const reason =
-    (indexIdentity?.status === "mismatched" || indexIdentity?.status === "missing") &&
-    typeof indexIdentity.reason === "string"
-      ? indexIdentity.reason
-      : undefined;
-  if (!reason) {
-    return null;
-  }
-  return {
-    reason,
-    fix: `Run: openclaw memory status --index --agent ${agentId}`,
-  };
-}
-function formatSourceLabel(source: string, workspaceDir: string, agentId: string): string {
+function formatSourceLabel(source: string, workspaceDir: string): string {
   if (source === "memory") {
     return shortenHomeInString(
       `memory (MEMORY.md + ${path.join(workspaceDir, "memory")}${path.sep}*.md)`,
     );
   }
   if (source === "sessions") {
-    const stateDir = resolveStateDir(process.env, os.homedir);
-    return shortenHomeInString(
-      `sessions (${path.join(stateDir, "agents", agentId, "sessions")}${path.sep}*.jsonl)`,
-    );
+    return "sessions (current transcripts + retained transcript artifacts)";
   }
   return source;
-}
-async function summarizeQmdIndexArtifact(manager: MemoryManager): Promise<string | null> {
-  const status = manager.status?.();
-  if (!status || status.backend !== "qmd") {
-    return null;
-  }
-  const dbPath = status.dbPath?.trim();
-  if (!dbPath) {
-    return null;
-  }
-  let stat: fsSync.Stats;
-  try {
-    stat = await fs.stat(dbPath);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") {
-      throw new Error(`QMD index file not found: ${shortenHomePath(dbPath)}`, { cause: err });
-    }
-    throw new Error(
-      `QMD index file check failed: ${shortenHomePath(dbPath)} (${code ?? "error"})`,
-      { cause: err },
-    );
-  }
-  if (!stat.isFile() || stat.size <= 0) {
-    throw new Error(`QMD index file is empty: ${shortenHomePath(dbPath)}`);
-  }
-  return `QMD index: ${shortenHomePath(dbPath)} (${stat.size} bytes)`;
 }
 export async function runMemoryIndex(
   opts: MemoryCommandOptions,
@@ -120,7 +66,7 @@ export async function runMemoryIndex(
           const status = manager.status();
           const label = (text: string) => muted(`${text}:`);
           const sourceLabels = (status.sources ?? []).map((source) =>
-            formatSourceLabel(source, status.workspaceDir ?? "", agentId),
+            formatSourceLabel(source, status.workspaceDir ?? ""),
           );
           const extraPaths = status.workspaceDir
             ? formatExtraPaths(status.workspaceDir, status.extraPaths ?? [])
@@ -199,11 +145,9 @@ export async function runMemoryIndex(
             }
           },
         );
-        const qmdIndexSummary = await summarizeQmdIndexArtifact(manager);
-        if (qmdIndexSummary) {
-          defaultRuntime.log(qmdIndexSummary);
-        }
         let postIndexStatus = manager.status();
+        const scan = await scanMemoryManagerSources(postIndexStatus, agentId);
+        const outcome = formatMemoryIndexOutcome(postIndexStatus, scan, agentId);
         let semanticVectorAvailable = postIndexStatus.vector?.semanticAvailable;
         const vectorStoreAvailable =
           postIndexStatus.vector?.storeAvailable ?? postIndexStatus.vector?.available;
@@ -226,14 +170,13 @@ export async function runMemoryIndex(
           postIndexStatus.vector?.available ??
           postIndexStatus.vector?.storeAvailable;
         const vectorLoadErr = postIndexStatus.vector?.loadError;
+        defaultRuntime.log(outcome);
         if (vectorEnabled && vectorAvailable === false) {
           // Indexing still persisted chunks/FTS state; keep the command successful but
           // emit a stderr warning so operators and scripts can detect degraded recall.
           defaultRuntime.error(
             `Memory index WARNING (${agentId}): chunks_vec not updated — ${formatMemoryVectorDegradedWriteReason(vectorLoadErr)}. Vector recall degraded.`,
           );
-        } else {
-          defaultRuntime.log(`Memory index updated (${agentId}).`);
         }
       } catch (err) {
         const message = formatErrorMessage(err);
@@ -284,10 +227,9 @@ export async function runMemorySearch(
         process.exitCode = 1;
         return;
       }
-      const workspaceDir =
-        typeof (manager as { status?: () => { workspaceDir?: string } }).status === "function"
-          ? manager.status().workspaceDir
-          : undefined;
+      const status = manager.status();
+      const staleness = resolveMemorySearchStaleness(status, agentId);
+      const workspaceDir = status.workspaceDir;
       if (dreamingEnabled) {
         await recordShortTermRecalls({
           workspaceDir,
@@ -300,17 +242,11 @@ export async function runMemorySearch(
         });
       }
       if (opts.json) {
-        defaultRuntime.writeJson({ results });
+        defaultRuntime.writeJson({ results, ...staleness });
         return;
       }
-      const identityWarning =
-        typeof manager.status === "function"
-          ? formatMemoryIndexIdentityWarning(manager.status(), agentId)
-          : null;
-      if (identityWarning) {
-        defaultRuntime.error(
-          `Memory index warning: ${identityWarning.reason}. Vector memory search is paused until the index is rebuilt. ${identityWarning.fix}`,
-        );
+      if (staleness) {
+        defaultRuntime.error(`${staleness.warning} ${staleness.action}`);
       }
       if (results.length === 0) {
         defaultRuntime.log("No matches.");
@@ -371,14 +307,17 @@ export async function runMemoryPromote(
       }
       let candidates: Awaited<ReturnType<typeof rankShortTermPromotionCandidates>>;
       try {
+        const gatherAllForApply = Boolean(opts.apply);
         candidates = await rankShortTermPromotionCandidates({
           workspaceDir,
-          limit: opts.limit,
-          minScore: opts.minScore ?? dreaming.minScore,
-          minRecallCount: opts.minRecallCount ?? dreaming.minRecallCount,
-          minUniqueQueries: opts.minUniqueQueries ?? dreaming.minUniqueQueries,
+          limit: gatherAllForApply ? undefined : opts.limit,
+          minScore: gatherAllForApply ? 0 : (opts.minScore ?? dreaming.minScore),
+          minRecallCount: gatherAllForApply ? 0 : (opts.minRecallCount ?? dreaming.minRecallCount),
+          minUniqueQueries: gatherAllForApply
+            ? 0
+            : (opts.minUniqueQueries ?? dreaming.minUniqueQueries),
           recencyHalfLifeDays: dreaming.recencyHalfLifeDays,
-          maxAgeDays: dreaming.maxAgeDays,
+          maxAgeDays: gatherAllForApply ? undefined : dreaming.maxAgeDays,
           includePromoted: Boolean(opts.includePromoted),
         });
       } catch (err) {
@@ -406,27 +345,35 @@ export async function runMemoryPromote(
           return;
         }
       }
+      const outputLimit =
+        typeof opts.limit === "number" && Number.isFinite(opts.limit)
+          ? Math.max(0, Math.floor(opts.limit))
+          : candidates.length;
+      const rejectedCandidates = applyResult
+        ? applyResult.rejectedCandidates.slice(
+            0,
+            Math.max(0, outputLimit - applyResult.appliedCandidates.length),
+          )
+        : [];
+      const outputCandidateKeys = applyResult
+        ? new Set([
+            ...applyResult.appliedCandidates.map((candidate) => candidate.key),
+            ...rejectedCandidates.map((rejection) => rejection.candidate.key),
+          ])
+        : undefined;
+      const outputCandidates = outputCandidateKeys
+        ? candidates.filter((candidate) => outputCandidateKeys.has(candidate.key))
+        : candidates;
       const storePath = resolveShortTermRecallStorePath(workspaceDir);
       const lockPath = resolveShortTermRecallLockPath(workspaceDir);
-      const customQmd = asRecord(asRecord(status.custom)?.qmd);
-      const audit = await auditShortTermPromotionArtifacts({
-        workspaceDir,
-        qmd:
-          status.backend === "qmd"
-            ? {
-                dbPath: status.dbPath,
-                collections:
-                  typeof customQmd?.collections === "number" ? customQmd.collections : undefined,
-              }
-            : undefined,
-      });
+      const audit = await auditShortTermPromotionArtifacts({ workspaceDir });
       if (opts.json) {
         defaultRuntime.writeJson({
           workspaceDir,
           storePath,
           lockPath,
           audit,
-          candidates,
+          candidates: outputCandidates,
           apply: applyResult
             ? {
                 applied: applyResult.applied,
@@ -434,6 +381,7 @@ export async function runMemoryPromote(
                 reconciledExisting: applyResult.reconciledExisting,
                 memoryPath: applyResult.memoryPath,
                 appliedCandidates: applyResult.appliedCandidates,
+                rejectedCandidates,
               }
             : undefined,
         });
@@ -453,7 +401,7 @@ export async function runMemoryPromote(
       lines.push(`${heading("Short-Term Promotion Candidates")} ${muted(`(${agentId})`)}`);
       lines.push(`${muted("Recall store:")} ${shortenHomePath(storePath)}`);
       lines.push(muted(`Store health: ${formatAuditCounts(audit)}`));
-      for (const candidate of candidates) {
+      for (const candidate of outputCandidates) {
         lines.push(
           `${success(candidate.score.toFixed(3))} ${accent(`${shortenHomePath(candidate.path)}:${candidate.startLine}-${candidate.endLine}`)}`,
         );
@@ -478,6 +426,11 @@ export async function runMemoryPromote(
         lines.push("");
       }
       if (applyResult) {
+        for (const rejection of rejectedCandidates) {
+          const candidate = rejection.candidate;
+          const source = `${shortenHomePath(candidate.path)}:${candidate.startLine}-${candidate.endLine}`;
+          lines.push(warn(`Skipped ${source}: ${rejection.reason}.`));
+        }
         if (applyResult.applied > 0) {
           lines.push(
             success(
@@ -489,7 +442,7 @@ export async function runMemoryPromote(
               `appended=${applyResult.appended} reconciledExisting=${applyResult.reconciledExisting}`,
             ),
           );
-        } else {
+        } else if (rejectedCandidates.length === 0) {
           lines.push(warn("No candidates met apply criteria."));
         }
       }

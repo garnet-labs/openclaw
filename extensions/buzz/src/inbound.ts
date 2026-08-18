@@ -17,18 +17,16 @@ import type { ResolvedBuzzAccount } from "./types.js";
 
 const log = createSubsystemLogger("buzz/inbound");
 
-function senderLabel(pubkey: string): string {
-  return `${pubkey.slice(0, 8)}...${pubkey.slice(-6)}`;
-}
-
 export async function handleBuzzInbound(params: {
   account: ResolvedBuzzAccount;
   cfg: OpenClawConfig;
   bus: BuzzBus;
   message: BuzzInboundMessage;
+  signal: AbortSignal;
+  buildContext?: typeof buildChannelInboundEventContext;
 }) {
   const runtime = getBuzzRuntime();
-  const { account, cfg, bus, message } = params;
+  const { account, cfg, bus, message, signal } = params;
   const channelId = parseBuzzTarget(message.channelId);
   const target = buildBuzzTarget(channelId);
   const textForAgent = formatBuzzMessageForAgent(message);
@@ -62,6 +60,12 @@ export async function handleBuzzInbound(params: {
       id: channelId,
       threadId: message.threadId,
     },
+    contextBinding: {
+      agentId: route.agentId,
+      sessionKey: route.sessionKey,
+      messageId: message.id,
+      inboundEventKind: "user_request",
+    },
     mentionFacts: { canDetectMention: true, wasMentioned },
     groupPolicy: account.config.groupPolicy,
     groupAllowFrom: account.config.groupAllowFrom,
@@ -82,14 +86,16 @@ export async function handleBuzzInbound(params: {
     return;
   }
 
-  const senderName = senderLabel(message.senderPubkey);
+  const senderName = bus.directory.resolveSenderName(message.senderPubkey);
+  const roomName = bus.directory.resolveRoomName(channelId);
   const body = buildEnvelope({
     channel: "Buzz",
     from: senderName,
     timestamp: new Date(message.createdAt * 1000),
     body: textForAgent,
   });
-  const ctxPayload = buildChannelInboundEventContext({
+  const ctxPayload = (params.buildContext ?? buildChannelInboundEventContext)({
+    channelIngress: access,
     channel: "buzz",
     accountId: route.accountId ?? account.accountId,
     messageId: message.id,
@@ -100,7 +106,7 @@ export async function handleBuzzInbound(params: {
     conversation: {
       kind: "group",
       id: channelId,
-      label: channelId,
+      label: roomName,
       threadId: message.threadId,
       nativeChannelId: channelId,
     },
@@ -128,8 +134,7 @@ export async function handleBuzzInbound(params: {
       mentions: { canDetectMention: true, wasMentioned },
     },
     extra: {
-      GroupChannel: channelId,
-      GroupSubject: channelId,
+      GroupSubject: roomName,
       BuzzEventKind: message.kind,
     },
   });
@@ -163,6 +168,9 @@ export async function handleBuzzInbound(params: {
       onError: (error) => {
         throw error instanceof Error ? error : new Error(String(error));
       },
+    },
+    replyOptions: {
+      abortSignal: signal,
     },
     replyPipeline: {
       typing: {

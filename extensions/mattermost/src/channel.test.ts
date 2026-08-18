@@ -31,6 +31,16 @@ import {
   withMockedGlobalFetch,
 } from "./mattermost/reactions.test-helpers.js";
 
+describe("mattermost target classification", () => {
+  it("requires an explicit user namespace for direct targets", () => {
+    expect(mattermostPlugin.messaging?.inferTargetChatType?.({ to: "user:owner" })).toBe("direct");
+    expect(mattermostPlugin.messaging?.inferTargetChatType?.({ to: "channel:operators" })).toBe(
+      "channel",
+    );
+    expect(mattermostPlugin.messaging?.inferTargetChatType?.({ to: "ambiguous" })).toBeUndefined();
+  });
+});
+
 type MattermostHandleAction = NonNullable<
   NonNullable<typeof mattermostPlugin.actions>["handleAction"]
 >;
@@ -1604,6 +1614,46 @@ describe("mattermostPlugin", () => {
       expect(options.buttons).toBeUndefined();
     });
 
+    it("keeps unsupported select commands actionable without exposing callback values", async () => {
+      const cfg = createMattermostTestConfig();
+
+      await mattermostPlugin.actions?.handleAction?.(
+        createMattermostActionContext({
+          action: "send",
+          params: {
+            to: "channel:CHAN1",
+            message: "Pick",
+            presentation: {
+              blocks: [
+                {
+                  type: "select",
+                  placeholder: "Environment",
+                  options: [
+                    {
+                      label: "Production",
+                      action: { type: "command", command: "/deploy production" },
+                    },
+                    {
+                      label: "Opaque",
+                      action: { type: "callback", value: "private-callback-token" },
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+          cfg,
+          accountId: "default",
+        }),
+      );
+
+      const options = expectSingleMattermostSend(
+        "channel:CHAN1",
+        "Pick\n\nEnvironment:\n- Production: `/deploy production`\n- Opaque",
+      );
+      expect(options.buttons).toBeUndefined();
+    });
+
     it("falls back to trimmed replyTo when replyToId is blank", async () => {
       const cfg = createMattermostTestConfig();
 
@@ -1689,7 +1739,7 @@ describe("mattermostPlugin", () => {
       expect(onDeliveryResult).toHaveBeenCalledWith({
         channel: "mattermost",
         messageId: "post-final",
-        channelId: "CHAN1",
+        target: { kind: "channel", id: "CHAN1" },
         content: "provider-final",
       });
     });

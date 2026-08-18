@@ -16,7 +16,7 @@ import { extractModelCompat } from "../../plugins/provider-model-compat.js";
 import type { ProviderRuntimeModel } from "../../plugins/provider-runtime-model.types.js";
 import { transformProviderSystemPrompt } from "../../plugins/provider-runtime.js";
 import { isCronSessionKey, isSubagentSessionKey } from "../../routing/session-key.js";
-import { resolveSkillsPromptForRun } from "../../skills/loading/workspace.js";
+import { resolveSkillsPrompt } from "../../skills/loading/workspace-skill-prompt.js";
 import { resolveEmbeddedRunSkillEntries } from "../../skills/runtime/embedded-run-entries.js";
 import {
   applySkillEnvOverrides,
@@ -27,8 +27,9 @@ import { isReasoningTagProvider } from "../../utils/provider-utils.js";
 import { createBundleLspToolRuntime } from "../agent-bundle-lsp-runtime.js";
 import { createBundleMcpToolRuntime } from "../agent-bundle-mcp-tools.js";
 import { resolveSessionAgentIds } from "../agent-scope.js";
-import { createOpenClawCodingTools, resolveProcessToolScopeKey } from "../agent-tools.js";
+import { createOpenClawCodingTools } from "../agent-tools.js";
 import { listActiveProcessSessionReferences } from "../bash-process-references.js";
+import { resolveProcessToolScopeKey } from "../bash-process-scope.js";
 import {
   makeBootstrapWarn,
   resolveBootstrapContextForRun,
@@ -66,9 +67,10 @@ import type { DirectCompactionPreparation } from "./direct-compaction-preparatio
 import { applyFinalEffectiveToolPolicy } from "./effective-tool-policy.js";
 import { log } from "./logger.js";
 import { buildEmbeddedMessageActionDiscoveryInput } from "./message-action-discovery-input.js";
-import { resolveAttemptSpawnWorkspaceDir } from "./run/attempt.thread-helpers.js";
+import { resolveAttemptSpawnWorkspaceDir } from "./run/attempt-thread-helpers.js";
 import { buildEmbeddedSandboxInfo, resolveEmbeddedSandboxInfoExecPolicy } from "./sandbox-info.js";
 import {
+  createSandboxPromptEntryLoader,
   mapSandboxSkillEntriesForPrompt,
   mapSandboxSkillUsagePaths,
   resolveSandboxSkillRuntimeInputs,
@@ -143,14 +145,15 @@ export async function buildPreparedCompactionRuntime(prepared: DirectCompactionP
       effectiveWorkspace,
       skillsSnapshot: params.skillsSnapshot,
     });
-    const { shouldLoadSkillEntries, skillEntries } = resolveEmbeddedRunSkillEntries({
-      workspaceDir: effectiveSkillsWorkspace,
-      config: params.config,
-      agentId: effectiveSkillAgentId,
-      eligibility: skillsEligibility,
-      skillsSnapshot: skillsSnapshotForRun,
-      workspaceOnly: loadSkillsWorkspaceOnly,
-    });
+    const { shouldLoadSkillEntries, skillEntries, loadSkillEntries } =
+      resolveEmbeddedRunSkillEntries({
+        workspaceDir: effectiveSkillsWorkspace,
+        config: params.config,
+        agentId: effectiveSkillAgentId,
+        eligibility: skillsEligibility,
+        skillsSnapshot: skillsSnapshotForRun,
+        workspaceOnly: loadSkillsWorkspaceOnly,
+      });
     restoreSkillEnv = skillsSnapshotForRun
       ? applySkillEnvOverridesFromSnapshot({
           snapshot: skillsSnapshotForRun,
@@ -170,9 +173,14 @@ export async function buildPreparedCompactionRuntime(prepared: DirectCompactionP
       skillsWorkspaceDir: effectiveSkillsWorkspace,
       skillsPromptWorkspaceDir: effectiveSkillsPromptWorkspace,
     });
-    const skillsPrompt = resolveSkillsPromptForRun({
+    const skillsPrompt = resolveSkillsPrompt({
       skillsSnapshot: skillsSnapshotForRun,
       entries: promptSkillEntries,
+      loadEntries: createSandboxPromptEntryLoader({
+        loadEntries: loadSkillEntries,
+        skillsWorkspaceDir: effectiveSkillsWorkspace,
+        skillsPromptWorkspaceDir: effectiveSkillsPromptWorkspace,
+      }),
       config: params.config,
       workspaceDir: effectiveSkillsPromptWorkspace,
       agentId: effectiveSkillAgentId,
@@ -190,6 +198,7 @@ export async function buildPreparedCompactionRuntime(prepared: DirectCompactionP
             config: params.config,
             sessionKey: params.sessionKey,
             sessionId: params.sessionId,
+            chatType: params.chatType,
             agentId: effectiveSkillAgentId,
             warn: makeBootstrapWarn({
               sessionLabel,
@@ -204,6 +213,7 @@ export async function buildPreparedCompactionRuntime(prepared: DirectCompactionP
       provider: contextConfigProvider,
       modelId,
       model: runtimeModelWithContext,
+      agentId: effectiveSkillAgentId,
       requestedTokenBudget: params.contextTokenBudget,
       fallbackTokenBudget: params.tokenBudget,
     });
@@ -266,6 +276,7 @@ export async function buildPreparedCompactionRuntime(prepared: DirectCompactionP
       agentAccountId: params.agentAccountId,
       messageProvider: resolvedMessageProvider,
       chatType: params.chatType,
+      conversationToolPolicy: params.conversationToolPolicy,
       groupId: params.groupId,
       groupChannel: params.groupChannel,
       groupSpace: params.groupSpace,
@@ -286,6 +297,7 @@ export async function buildPreparedCompactionRuntime(prepared: DirectCompactionP
       sandboxToolPolicy: sandbox?.tools,
       inputProvenance: params.inputProvenance,
       trustedInternalHandoff: params.trustedInternalHandoff,
+      pluginMetadataSnapshot: params.preparedModelRuntime.metadataSnapshot,
     });
     const toolsEnabled = supportsModelTools(effectiveModel);
     const toolsRaw = toolsEnabled
@@ -334,6 +346,7 @@ export async function buildPreparedCompactionRuntime(prepared: DirectCompactionP
           skillsSnapshot: skillsSnapshotForRun,
           skillUsagePaths,
           conversationCapabilityProfile: runtimeCapabilityProfile,
+          preparedModelRuntime: params.preparedModelRuntime,
           modelAuthMode: resolveModelAuthMode(effectiveModel.provider, params.config, undefined, {
             workspaceDir: effectiveWorkspace,
           }),

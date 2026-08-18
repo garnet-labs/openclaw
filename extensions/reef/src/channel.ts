@@ -1,3 +1,4 @@
+import type { ChannelThreadingToolContext } from "openclaw/plugin-sdk/channel-contract";
 import {
   dispatchInboundDirectDm,
   recordChannelBotPairLoopAndCheckSuppression,
@@ -10,6 +11,7 @@ import {
   type ChannelPlugin,
 } from "openclaw/plugin-sdk/core";
 import { createChannelDirectoryAdapter } from "openclaw/plugin-sdk/directory-runtime";
+import { channelReadyPatch } from "openclaw/plugin-sdk/gateway-runtime";
 import { runReefChannelLifecycle } from "./channel-lifecycle.js";
 import {
   ReefChannelConfigSchema,
@@ -31,7 +33,7 @@ import {
 } from "./owner-notice.js";
 import { isRephrasedReefResend } from "./rejection-resend.js";
 import { getActiveReef, getOptionalReefRuntime, getReefRuntime, setActiveReef } from "./runtime.js";
-import { reefSetupAdapter, reefSetupContract, reefSetupWizard } from "./setup.js";
+import { reefSetupContract, reefSetupWizard } from "./setup.js";
 import { assertReefIdentityBinding, loadKeys, openStores, ReefInboxCursorStore } from "./state.js";
 import {
   ReefInboxConnection,
@@ -93,6 +95,12 @@ function replyText(payload: unknown): string {
     : "";
 }
 
+function matchesReefToolTarget(target: string, toolContext?: ChannelThreadingToolContext): boolean {
+  const currentTarget = toolContext?.currentMessagingTarget ?? toolContext?.currentChannelId;
+  const normalizedCurrent = normalizeReefTarget(currentTarget ?? "");
+  return normalizedCurrent !== undefined && normalizeReefTarget(target) === normalizedCurrent;
+}
+
 export const reefPlugin: ChannelPlugin<ReefAccount> = {
   id: "reef",
   meta: {
@@ -115,7 +123,6 @@ export const reefPlugin: ChannelPlugin<ReefAccount> = {
   },
   reload: { configPrefixes: ["channels.reef"] },
   configSchema: buildChannelConfigSchema(ReefChannelConfigSchema),
-  setup: reefSetupAdapter,
   setupContract: reefSetupContract,
   setupWizard: reefSetupWizard as never,
   config: {
@@ -168,6 +175,26 @@ export const reefPlugin: ChannelPlugin<ReefAccount> = {
         : null;
     },
   },
+  threading: {
+    threadAddressing: "message",
+    matchesToolContextTarget: ({ target, toolContext }) =>
+      matchesReefToolTarget(target, toolContext),
+    resolveReplyToMode: () => "all",
+    buildToolContext: ({ context, hasRepliedRef }) => {
+      const currentTarget = context.To?.trim() || undefined;
+      return {
+        currentChannelId: currentTarget,
+        currentMessagingTarget: currentTarget,
+        currentMessageId: context.CurrentMessageId,
+        currentThreadTs:
+          context.MessageThreadId != null ? String(context.MessageThreadId) : undefined,
+        replyToMode: context.ReplyToMode ?? "all",
+        hasRepliedRef,
+      };
+    },
+    resolveAutoThreadId: ({ to, toolContext }) =>
+      matchesReefToolTarget(to, toolContext) ? toolContext?.currentThreadTs : undefined,
+  },
   directory: createChannelDirectoryAdapter({
     listPeers: async ({ cfg, query, limit }) =>
       listTrustedPeerDirectoryEntries({
@@ -210,6 +237,7 @@ export const reefPlugin: ChannelPlugin<ReefAccount> = {
       configured: account.configured,
       running: runtime?.running ?? false,
       connected: runtime?.connected ?? false,
+      lifecycle: runtime?.lifecycle,
       lastConnectedAt: runtime?.lastConnectedAt ?? null,
       lastError: runtime?.lastError ?? null,
       extra: { handle: account.config.handle },
@@ -267,6 +295,7 @@ export const reefPlugin: ChannelPlugin<ReefAccount> = {
           return;
         }
         await dispatchInboundDirectDm({
+          channelIngress: "unsupported",
           cfg: ctx.cfg,
           channel: "reef",
           channelLabel: "Reef",
@@ -324,6 +353,7 @@ export const reefPlugin: ChannelPlugin<ReefAccount> = {
           let resendText = "";
           let dispatchFailure: Error | undefined;
           await dispatchInboundDirectDm({
+            channelIngress: "unsupported",
             cfg: ctx.cfg,
             channel: "reef",
             channelLabel: "Reef",
@@ -438,14 +468,13 @@ export const reefPlugin: ChannelPlugin<ReefAccount> = {
             }
             ctx.setStatus(
               state === "connected"
-                ? {
+                ? channelReadyPatch({ accountId: "default" })
+                : {
                     accountId: "default",
                     running: true,
-                    connected: true,
-                    lastConnectedAt: Date.now(),
-                    lastError: null,
-                  }
-                : { accountId: "default", running: true, connected: false },
+                    connected: false,
+                    lifecycle: "recovering",
+                  },
             );
           },
           onError: (error) => {
@@ -457,6 +486,7 @@ export const reefPlugin: ChannelPlugin<ReefAccount> = {
               accountId: "default",
               running: true,
               connected: false,
+              lifecycle: "recovering",
               lastError: error.message,
             });
           },

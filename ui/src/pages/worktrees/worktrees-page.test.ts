@@ -2,9 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WorktreeRecord } from "../../../../packages/gateway-protocol/src/index.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ApplicationContext, ApplicationGatewaySnapshot } from "../../app/context.ts";
+import { showConfirmDialog } from "../../components/confirm-dialog.ts";
 import { SESSION_FACE_PREFERENCE_PARAM } from "../../lib/sessions/route-navigation.ts";
 import { waitForFast } from "../../test-helpers/wait-for.ts";
 import "./worktrees-page.ts";
+
+vi.mock("../../components/confirm-dialog.ts", () => ({ showConfirmDialog: vi.fn() }));
 
 type WorktreesPageTestElement = HTMLElement & {
   context: ApplicationContext;
@@ -109,6 +112,7 @@ function contextWithGateway(gateway: ApplicationContext["gateway"]): Application
 
 afterEach(() => {
   document.body.replaceChildren();
+  vi.mocked(showConfirmDialog).mockReset();
   vi.restoreAllMocks();
 });
 
@@ -193,16 +197,16 @@ describe("WorktreesPage lifecycle", () => {
 
     const deleteButton = page.querySelector<HTMLButtonElement>("button.danger");
     expect(deleteButton?.disabled).toBe(true);
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.mocked(showConfirmDialog).mockResolvedValue(true);
     await page.removeWorktree(record);
-    expect(confirm).not.toHaveBeenCalled();
+    expect(showConfirmDialog).not.toHaveBeenCalled();
     expect(request).not.toHaveBeenCalledWith("worktrees.remove", { id: record.id });
 
     pendingList.resolve({ worktrees: [record] });
     await refreshing;
 
     await page.removeWorktree(record);
-    expect(confirm).toHaveBeenCalledOnce();
+    expect(showConfirmDialog).toHaveBeenCalledOnce();
     expect(request).toHaveBeenCalledWith("worktrees.remove", { id: record.id });
     expect(listRequests).toBe(3);
     expect(page.records).toEqual([removedRecord]);
@@ -281,7 +285,7 @@ describe("WorktreesPage lifecycle", () => {
     page.context = contextWithGateway(
       gatewayWithClient({ request: firstRequest } as unknown as GatewayBrowserClient),
     );
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.mocked(showConfirmDialog).mockResolvedValue(true);
     document.body.append(page);
     await waitForFast(() =>
       expect(firstRequest).toHaveBeenCalledWith(
@@ -304,7 +308,7 @@ describe("WorktreesPage lifecycle", () => {
     pendingRemove.reject(new Error("snapshot failed: stale gateway"));
     await removing;
 
-    expect(confirm).toHaveBeenCalledOnce();
+    expect(showConfirmDialog).toHaveBeenCalledOnce();
     expect(secondRequest).not.toHaveBeenCalledWith("worktrees.remove", {
       id: "worktree-1",
       force: true,
@@ -313,11 +317,37 @@ describe("WorktreesPage lifecycle", () => {
     expect(page.busyId).toBeNull();
   });
 
-  it("offers force removal when the gateway reports a snapshot failure", async () => {
+  it("does not remove through a replacement gateway after confirmation", async () => {
+    const confirmation = deferred<boolean>();
+    vi.mocked(showConfirmDialog).mockReturnValueOnce(confirmation.promise);
+    const firstRequest = vi.fn(async () => ({ worktrees: [] }));
+    const secondRequest = vi.fn(async () => ({ worktrees: [] }));
+    const page = document.createElement("openclaw-worktrees-page") as WorktreesPageTestElement;
+    page.context = contextWithGateway(
+      gatewayWithClient({ request: firstRequest } as unknown as GatewayBrowserClient),
+    );
+    document.body.append(page);
+    await waitForFast(() => expect(firstRequest).toHaveBeenCalledOnce());
+
+    const removing = page.removeWorktree(worktree());
+    await waitForFast(() => expect(showConfirmDialog).toHaveBeenCalledOnce());
+    page.context = contextWithGateway(
+      gatewayWithClient({ request: secondRequest } as unknown as GatewayBrowserClient),
+    );
+    page.requestUpdate();
+    await page.updateComplete;
+    confirmation.resolve(true);
+    await removing;
+
+    expect(firstRequest).not.toHaveBeenCalledWith("worktrees.remove", { id: "worktree-1" });
+    expect(secondRequest).not.toHaveBeenCalledWith("worktrees.remove", { id: "worktree-1" });
+  });
+
+  it("surfaces the snapshot failure after a forced removal", async () => {
     const request = vi.fn((method: string, params?: Record<string, unknown>) => {
       if (method === "worktrees.remove") {
         return params?.force
-          ? Promise.resolve({ removed: true })
+          ? Promise.resolve({ removed: true, snapshotError: "nested gitlink" })
           : Promise.resolve({ removed: false, snapshotError: "nested gitlink" });
       }
       return Promise.resolve({ worktrees: [] });
@@ -326,7 +356,7 @@ describe("WorktreesPage lifecycle", () => {
     page.context = contextWithGateway(
       gatewayWithClient({ request } as unknown as GatewayBrowserClient),
     );
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.mocked(showConfirmDialog).mockResolvedValue(true);
     document.body.append(page);
     await waitForFast(() =>
       expect(request).toHaveBeenCalledWith(
@@ -340,8 +370,10 @@ describe("WorktreesPage lifecycle", () => {
 
     expect(request).toHaveBeenCalledWith("worktrees.remove", { id: "worktree-1" });
     expect(request).toHaveBeenCalledWith("worktrees.remove", { id: "worktree-1", force: true });
-    expect(confirm).toHaveBeenCalledTimes(2);
-    expect(page.error).toBeNull();
+    expect(showConfirmDialog).toHaveBeenCalledTimes(2);
+    expect(page.error).toBe("nested gitlink");
+    await page.updateComplete;
+    expect(page.querySelector(".callout.danger")?.textContent).toContain("nested gitlink");
   });
 
   it("discards a restore error across a same-client reconnect", async () => {
@@ -387,7 +419,7 @@ describe("WorktreesPage lifecycle", () => {
         return Promise.resolve({ worktrees: [record] });
       }
       if (method === "worktrees.restore") {
-        return Promise.reject(new Error("restore failed"));
+        return Promise.reject(new Error("restore failed: OPENAI_API_KEY=sk-1234567890abcdef"));
       }
       return Promise.resolve({});
     });
@@ -402,7 +434,7 @@ describe("WorktreesPage lifecycle", () => {
     await page.restore(record);
 
     expect(listRequests).toBe(2);
-    expect(page.error).toBe("Error: restore failed");
+    expect(page.error).toBe("restore failed: OPENAI_API_KEY=sk-123...cdef");
     expect(page.busyId).toBeNull();
   });
 
@@ -432,7 +464,7 @@ describe("WorktreesPage lifecycle", () => {
     await page.restore(record);
 
     expect(listRequests).toBe(2);
-    expect(page.error).toBe("Error: list failed");
+    expect(page.error).toBe("list failed");
     expect(page.busyId).toBeNull();
   });
 
@@ -455,11 +487,11 @@ describe("WorktreesPage lifecycle", () => {
       gatewayWithClient({ request } as unknown as GatewayBrowserClient),
     );
     document.body.append(page);
-    await waitForFast(() => expect(page.error).toBe("Error: stale list failure"));
+    await waitForFast(() => expect(page.error).toBe("stale list failure"));
 
     await page.restore(worktree());
 
-    expect(page.error).toBe("Error: restore failed");
+    expect(page.error).toBe("restore failed");
   });
 
   it("clears pending create state across a same-client reconnect", async () => {

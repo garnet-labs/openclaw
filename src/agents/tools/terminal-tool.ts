@@ -1,5 +1,4 @@
 import { Type } from "typebox";
-import type { UiCommandParams } from "../../../packages/gateway-protocol/src/index.js";
 import type { GatewayRequestContext } from "../../gateway/server-methods/types.js";
 import { renderTerminalBufferText } from "../../gateway/terminal/buffer-text.js";
 import { buildTerminalEnv, resolveTerminalSpawnPlan } from "../../gateway/terminal/launch.js";
@@ -8,14 +7,18 @@ import {
   TerminalOpenDeadlineError,
   waitForTerminalOpenDeadline,
 } from "../../gateway/terminal/open-deadline.js";
+import { getAgentRunTaskRunId } from "../../infra/agent-run-registry.js";
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
+import { isTerminalTaskStatus } from "../../tasks/task-executor-policy.js";
+import type { TaskRecord } from "../../tasks/task-registry.types.js";
 import type { AnyAgentTool } from "./common.js";
-import { jsonResult, readPositiveIntegerParam, readStringParam, ToolInputError } from "./common.js";
 import {
-  callInProcessGatewayTool,
-  getInProcessGatewayToolContext,
-  type InProcessGatewayCaller,
-} from "./in-process-gateway.js";
+  jsonResult,
+  readPositiveIntegerParam,
+  readToolStringParam,
+  ToolInputError,
+} from "./common.js";
+import { getInProcessGatewayToolContext } from "./in-process-gateway.js";
 
 const ACTIONS = ["open", "read", "input", "resize", "close", "list"] as const;
 const DEFAULT_COLS = 100;
@@ -31,7 +34,6 @@ const TerminalToolSchema = Type.Object(
     data: Type.Optional(Type.String({ description: "Raw terminal input" })),
     cols: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_DIMENSION })),
     rows: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_DIMENSION })),
-    show: Type.Optional(Type.Boolean({ description: "Show in web UI. Default: true" })),
   },
   { additionalProperties: false },
 );
@@ -73,9 +75,22 @@ type TerminalToolGatewayContext = Pick<
 type TerminalToolOptions = {
   agentId?: string;
   agentSessionKey?: string;
-  callGateway?: InProcessGatewayCaller;
+  runId?: string;
+  lookupTaskByRunIdForChildSession?: (
+    runId: string,
+    childSessionKey: string,
+  ) => Promise<Pick<TaskRecord, "taskId" | "status" | "childSessionKey"> | undefined>;
   getGatewayContext?: () => TerminalToolGatewayContext | undefined;
 };
+
+async function lookupTaskByRunIdForChildSession(
+  runId: string,
+  childSessionKey: string,
+): Promise<Pick<TaskRecord, "taskId" | "status" | "childSessionKey"> | undefined> {
+  const { findTaskByRunIdForChildSessionForStatus } =
+    await import("../../tasks/task-status-access.js");
+  return findTaskByRunIdForChildSessionForStatus(runId, childSessionKey);
+}
 
 function readDimension(
   params: Record<string, unknown>,
@@ -95,18 +110,7 @@ function readDimension(
   throw new ToolInputError(`${key} required`);
 }
 
-function readShow(params: Record<string, unknown>): boolean {
-  const value = params.show;
-  if (value === undefined) {
-    return true;
-  }
-  if (typeof value !== "boolean") {
-    throw new ToolInputError("show must be boolean");
-  }
-  return value;
-}
-
-function readOptionalString(
+function readOptionalStringParam(
   params: Record<string, unknown>,
   key: "command" | "cwd",
   options: { trim?: boolean } = {},
@@ -117,11 +121,11 @@ function readOptionalString(
   if (typeof params[key] !== "string") {
     throw new ToolInputError(`${key} must be string`);
   }
-  return readStringParam(params, key, options);
+  return readToolStringParam(params, key, options);
 }
 
 function requireSessionId(params: Record<string, unknown>): string {
-  return readStringParam(params, "sessionId", { required: true });
+  return readToolStringParam(params, "sessionId", { required: true });
 }
 
 function launchBlockMessage(
@@ -136,26 +140,30 @@ function launchBlockMessage(
   if (block.kind === "unknown-agent") {
     return `unknown agent: ${block.agentId}`;
   }
+  if (block.kind === "owner-required") {
+    return block.message;
+  }
   return `terminal unavailable: agent sandboxed (${block.mode})`;
 }
 
 export function createTerminalTool(opts: TerminalToolOptions = {}): AnyAgentTool {
-  const gatewayCall = opts.callGateway ?? callInProcessGatewayTool;
   const getContext = opts.getGatewayContext ?? getInProcessGatewayToolContext;
+  const findOwnerTask = opts.lookupTaskByRunIdForChildSession ?? lookupTaskByRunIdForChildSession;
   return {
     label: "Terminal",
     name: "terminal",
     description:
-      "Own terminal on gateway host. open/read/input/resize/close/list. User sees it in web UI, can type too. read = buffer snapshot.",
+      "Own terminal on gateway host. open/read/input/resize/close/list. Operator can attach in web UI and type too. read = buffer snapshot.",
     parameters: TerminalToolSchema,
     outputSchema: TerminalToolOutputSchema,
     execute: async (_toolCallId, rawArgs, signal) => {
       const params = rawArgs as Record<string, unknown>;
-      const action = readStringParam(params, "action", { required: true });
+      const action = readToolStringParam(params, "action", { required: true });
       const agentSessionKey = opts.agentSessionKey?.trim();
       if (!agentSessionKey) {
         throw new ToolInputError("agent session required");
       }
+      const agentId = opts.agentId?.trim() || resolveAgentIdFromSessionKey(agentSessionKey);
       const context = getContext();
       const manager = context?.terminalSessions;
       if (!context || !manager) {
@@ -163,19 +171,17 @@ export function createTerminalTool(opts: TerminalToolOptions = {}): AnyAgentTool
       }
 
       if (action === "list") {
-        return jsonResult({ sessions: manager.listAgent(agentSessionKey) });
+        return jsonResult({ sessions: manager.listAgent(agentSessionKey, agentId) });
       }
 
       if (action === "open") {
-        const command = readOptionalString(params, "command", { trim: false });
-        const cwd = readOptionalString(params, "cwd");
+        const command = readOptionalStringParam(params, "command", { trim: false });
+        const cwd = readOptionalStringParam(params, "cwd");
         const cols = readDimension(params, "cols", DEFAULT_COLS);
         const rows = readDimension(params, "rows", DEFAULT_ROWS);
-        const show = readShow(params);
         if (!context.isTerminalEnabled()) {
           throw new ToolInputError("terminal disabled");
         }
-        const agentId = opts.agentId?.trim() || resolveAgentIdFromSessionKey(agentSessionKey);
         const launch = context.resolveTerminalLaunchPolicy(agentId);
         if (!launch.ok) {
           throw new ToolInputError(launchBlockMessage(launch.block));
@@ -184,6 +190,19 @@ export function createTerminalTool(opts: TerminalToolOptions = {}): AnyAgentTool
           ...launch.plan,
           ...(cwd ? { cwdOverride: cwd } : {}),
         });
+        const runId = opts.runId?.trim();
+        const taskLookupId = runId ? (getAgentRunTaskRunId(runId) ?? runId) : undefined;
+        const task = taskLookupId ? await findOwnerTask(taskLookupId, agentSessionKey) : undefined;
+        if (task && isTerminalTaskStatus(task.status)) {
+          throw new ToolInputError("terminal task already ended");
+        }
+        const taskId = task?.taskId;
+        const owner = {
+          kind: "agent",
+          agentSessionKey,
+          agentId,
+          ...(taskId ? { taskId } : {}),
+        } as const;
         const deadline = createTerminalOpenDeadline();
         const cancelOpen = () => {
           if (!deadline.controller.signal.aborted) {
@@ -200,7 +219,7 @@ export function createTerminalTool(opts: TerminalToolOptions = {}): AnyAgentTool
         try {
           outcome = await waitForTerminalOpenDeadline(() => {
             openingTerminal = manager.open({
-              owner: { kind: "agent", agentSessionKey },
+              owner,
               agentId: spawnPlan.agentId,
               cwd: spawnPlan.cwd,
               shell: spawnPlan.shell,
@@ -217,7 +236,7 @@ export function createTerminalTool(opts: TerminalToolOptions = {}): AnyAgentTool
             void openingTerminal.then(
               (lateOutcome) => {
                 if (lateOutcome.ok) {
-                  manager.closeAgent(agentSessionKey, lateOutcome.sessionId);
+                  manager.closeAgent(agentSessionKey, lateOutcome.sessionId, agentId);
                 }
               },
               () => undefined,
@@ -235,45 +254,31 @@ export function createTerminalTool(opts: TerminalToolOptions = {}): AnyAgentTool
         }
         if (
           command !== undefined &&
-          !manager.writeAgent(agentSessionKey, outcome.sessionId, `${command}\r`)
+          !manager.writeAgent(agentSessionKey, outcome.sessionId, `${command}\r`, agentId)
         ) {
-          manager.closeAgent(agentSessionKey, outcome.sessionId);
+          manager.closeAgent(agentSessionKey, outcome.sessionId, agentId);
           throw new ToolInputError("terminal command failed");
-        }
-        if (show) {
-          const uiCommand: UiCommandParams = {
-            command: {
-              kind: "panel",
-              panel: "terminal",
-              open: true,
-              terminalSessionId: outcome.sessionId,
-            },
-            sessionKey: agentSessionKey,
-          };
-          try {
-            await gatewayCall("ui.command", uiCommand);
-          } catch {
-            // Terminal remains useful when no capable Control UI is connected.
-          }
         }
         return jsonResult(outcome);
       }
 
       const sessionId = requireSessionId(params);
       if (action === "read") {
-        const raw = manager.snapshotAgent(agentSessionKey, sessionId);
+        const raw = manager.snapshotAgent(agentSessionKey, sessionId, agentId);
         if (raw === undefined) {
           throw new ToolInputError("terminal not owned by this agent session");
         }
         return jsonResult({ sessionId, text: renderTerminalBufferText(raw) });
       }
       if (action === "input") {
-        const data = readStringParam(params, "data", {
+        const data = readToolStringParam(params, "data", {
           required: true,
           trim: false,
           allowEmpty: true,
         });
-        return jsonResult({ ok: manager.writeAgent(agentSessionKey, sessionId, data) });
+        return jsonResult({
+          ok: manager.writeAgent(agentSessionKey, sessionId, data, agentId),
+        });
       }
       if (action === "resize") {
         return jsonResult({
@@ -282,11 +287,12 @@ export function createTerminalTool(opts: TerminalToolOptions = {}): AnyAgentTool
             sessionId,
             readDimension(params, "cols"),
             readDimension(params, "rows"),
+            agentId,
           ),
         });
       }
       if (action === "close") {
-        return jsonResult({ ok: manager.closeAgent(agentSessionKey, sessionId) });
+        return jsonResult({ ok: manager.closeAgent(agentSessionKey, sessionId, agentId) });
       }
       throw new ToolInputError(`Unknown action: ${action}`);
     },

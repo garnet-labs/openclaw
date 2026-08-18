@@ -1,10 +1,10 @@
 // Cron simple command registration: remove, toggle, show, runs, and run-now.
 import {
+  parseStrictPositiveInteger,
   resolvePositiveTimerTimeoutMs,
   resolveTimerTimeoutMs,
 } from "@openclaw/normalization-core/number-coercion";
 import type { Command } from "commander";
-import { parseStrictPositiveInteger } from "../../infra/parse-finite-number.js";
 import { defaultRuntime } from "../../runtime.js";
 import { sleep } from "../../utils/sleep.js";
 import type { GatewayRpcOpts } from "../gateway-rpc.js";
@@ -12,8 +12,10 @@ import { addGatewayClientOptions, callGatewayFromCli } from "../gateway-rpc.js";
 import { parseDurationMs } from "../parse-duration.js";
 import { parseTimeoutMs } from "../parse-timeout.js";
 import { findCronJobByIdOrName } from "./list-jobs.js";
+import { createCronOutputCommand } from "./output-mode.js";
 import {
   enrichCronJsonWithStatus,
+  formatCronLookupMiss,
   handleCronCliError,
   printCronJson,
   printCronShow,
@@ -101,8 +103,7 @@ function registerCronToggleCommand(params: {
   enabled: boolean;
 }) {
   addGatewayClientOptions(
-    params.cron
-      .command(params.name)
+    createCronOutputCommand(params.cron, params.name)
       .description(params.description)
       .argument("<id>", "Job id")
       .action(async (id, opts) => {
@@ -127,13 +128,9 @@ function registerCronToggleCommand(params: {
 
 export function registerCronSimpleCommands(cron: Command) {
   addGatewayClientOptions(
-    cron
-      .command("rm")
-      .alias("remove")
-      .alias("delete")
+    createCronOutputCommand(cron, "rm")
       .description("Remove an automation")
       .argument("<id>", "Job id")
-      .option("--json", "Output JSON", false)
       .action(async (id, opts) => {
         try {
           const res = await callGatewayFromCli("cron.remove", opts, { id });
@@ -158,8 +155,7 @@ export function registerCronSimpleCommands(cron: Command) {
   });
 
   addGatewayClientOptions(
-    cron
-      .command("get")
+    createCronOutputCommand(cron, "get")
       .description("Get an automation as JSON")
       .argument("<id>", "Job id")
       .action(async (id, opts) => {
@@ -184,7 +180,7 @@ export function registerCronSimpleCommands(cron: Command) {
             includeDeliveryPreview: !opts.json,
           });
           if (!job) {
-            throw new Error(`automation not found: ${String(id)}`);
+            throw new Error(formatCronLookupMiss(String(id)));
           }
           if (opts.json) {
             printCronJson(enrichCronJsonWithStatus(job));
@@ -198,8 +194,7 @@ export function registerCronSimpleCommands(cron: Command) {
   );
 
   addGatewayClientOptions(
-    cron
-      .command("runs")
+    createCronOutputCommand(cron, "runs")
       .description("Show automation run history")
       .requiredOption("--id <id>", "Job id")
       .option("--run-id <runId>", "Filter by cron run id")
@@ -211,6 +206,9 @@ export function registerCronSimpleCommands(cron: Command) {
             throw new Error("Invalid --limit (must be a positive integer).");
           }
           const id = String(opts.id);
+          if (typeof opts.runId === "string" && !opts.runId.trim()) {
+            throw new Error("--run-id must not be blank");
+          }
           const res = await callGatewayFromCli("cron.runs", opts, {
             id,
             ...(typeof opts.runId === "string" && opts.runId.trim() ? { runId: opts.runId } : {}),
@@ -224,8 +222,7 @@ export function registerCronSimpleCommands(cron: Command) {
   );
 
   addGatewayClientOptions(
-    cron
-      .command("run")
+    createCronOutputCommand(cron, "run")
       .description("Run an automation now (debug)")
       .argument("<id>", "Job id")
       .option("--due", "Run only when due (default behavior in older versions)", false)

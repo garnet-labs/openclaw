@@ -2,11 +2,14 @@ import { consume } from "@lit/context";
 import { initialState, Task, TaskStatus } from "@lit/task";
 import { html, nothing } from "lit";
 import { state } from "lit/decorators.js";
-import type { WorktreeRecord } from "../../../../packages/gateway-protocol/src/index.js";
+import type {
+  WorktreeRecord,
+  WorktreesRemoveResult,
+} from "../../../../packages/gateway-protocol/src/index.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import { subtitleForRoute, titleForRoute } from "../../app-navigation.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
-import { shouldHandleNavigationClick } from "../../components/app-sidebar-nav-menus.ts";
+import { showConfirmDialog } from "../../components/confirm-dialog.ts";
 import { renderSessionsHubHeader } from "../../components/sessions-hub-header.ts";
 import {
   renderDocsLink,
@@ -18,33 +21,26 @@ import {
 } from "../../components/settings-ui.ts";
 import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
 import { t } from "../../i18n/index.ts";
+import { formatUiError } from "../../lib/format-error.ts";
 import { formatRelativeTimestamp } from "../../lib/format.ts";
+import { shouldHandleNavigationClick } from "../../lib/navigation-click.ts";
+import { repoName } from "../../lib/session-display.ts";
 import {
   resolveSessionPreferredFaceForKey,
   sessionNavigationTarget,
 } from "../../lib/sessions/route-navigation.ts";
+import { createManagedWorktree } from "../../lib/worktrees/create-worktree.ts";
+import { GatewayPageController } from "../../lit/gateway-page-controller.ts";
 import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
-import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
 
 const WORKTREES_DOCS_URL = "https://docs.openclaw.ai/concepts/managed-worktrees";
 
 type WorktreesListResult = { worktrees: WorktreeRecord[] };
-type WorktreesRemoveResult = { removed: boolean; snapshotError?: string };
 type WorktreeBranchesResult = {
   branches: Array<{ name: string }>;
   defaultBranch?: string;
   headBranch?: string;
 };
-
-type WorktreeOperationScope = {
-  gateway: ApplicationContext["gateway"];
-  client: GatewayBrowserClient;
-  epoch: number;
-};
-
-function repoName(repoRoot: string): string {
-  return repoRoot.split(/[\\/]/).findLast(Boolean) ?? repoRoot;
-}
 
 class WorktreesPage extends OpenClawLightDomElement {
   @consume({ context: applicationContext, subscribe: true })
@@ -60,43 +56,41 @@ class WorktreesPage extends OpenClawLightDomElement {
   @state() private createBranches: string[] = [];
   @state() private creating = false;
   @state() private gcLoading = false;
-  private client: GatewayBrowserClient | null = null;
   private listClient: GatewayBrowserClient | null = null;
-  private gatewayConnected = false;
-  private gatewaySource?: ApplicationContext["gateway"];
-  private hasBoundGateway = false;
-  private operationEpoch = 0;
-  private readonly subscriptions = new SubscriptionsController(this).effect(
-    () => this.context?.gateway,
-    (gateway) => {
-      const sourceChanged = this.hasBoundGateway && this.gatewaySource !== gateway;
-      this.gatewaySource = gateway;
-      this.hasBoundGateway = true;
-      this.applyGatewaySnapshot(gateway.snapshot, sourceChanged);
-      return gateway.subscribe((snapshot) => {
-        if (this.gatewaySource === gateway && this.context.gateway === gateway) {
-          this.applyGatewaySnapshot(snapshot);
-        }
-      });
+  private readonly gateway = new GatewayPageController(this, {
+    getGateway: () => this.context?.gateway,
+    onIdentityChange: () => {
+      this.records = [];
+      this.error = null;
     },
-  );
+    invalidateRequests: (change) => {
+      if (change.snapshot.phase !== "connected" || !change.snapshot.client) {
+        this.listClient = null;
+        void this.listTask.run([null]);
+      }
+      void this.branchesTask.run([null, ""]);
+      this.invalidateOperations();
+    },
+    ensureInitialData: () => void this.load(),
+  });
 
   private readonly listTask = new Task(this, {
     autoRun: false,
-    args: () => [this.gatewayConnected ? this.client : null] as const,
+    args: () => [this.gateway.connected ? this.gateway.client : null] as const,
     task: ([client], { signal }) =>
       client ? client.request<WorktreesListResult>("worktrees.list", {}, { signal }) : initialState,
     onComplete: (result) => {
       this.records = result.worktrees.toSorted((a, b) => b.lastActiveAt - a.lastActiveAt);
     },
     onError: (error) => {
-      this.error = String(error);
+      this.error = formatUiError(error);
     },
   });
 
   private readonly branchesTask = new Task(this, {
     autoRun: false,
-    args: () => [this.gatewayConnected ? this.client : null, this.createRepoRoot.trim()] as const,
+    args: () =>
+      [this.gateway.connected ? this.gateway.client : null, this.createRepoRoot.trim()] as const,
     task: ([client, repoRoot], { signal }) =>
       client && repoRoot
         ? client.request<WorktreeBranchesResult>("worktrees.branches", { repoRoot }, { signal })
@@ -113,74 +107,16 @@ class WorktreesPage extends OpenClawLightDomElement {
   });
 
   override disconnectedCallback() {
-    this.subscriptions.clear();
     this.listClient = null;
     void this.listTask.run([null]);
     void this.branchesTask.run([null, ""]);
-    this.invalidateOperations();
-    this.gatewaySource = undefined;
-    this.client = null;
-    this.gatewayConnected = false;
     super.disconnectedCallback();
   }
 
-  private applyGatewaySnapshot(
-    snapshot: ApplicationContext["gateway"]["snapshot"],
-    sourceChanged = false,
-  ) {
-    const clientChanged = snapshot.client !== this.client;
-    const connectionChanged = (snapshot.phase === "connected") !== this.gatewayConnected;
-    const identityChanged = sourceChanged || clientChanged;
-    this.client = snapshot.client;
-    this.gatewayConnected = snapshot.phase === "connected";
-    if (identityChanged || connectionChanged) {
-      if (snapshot.phase !== "connected" || !snapshot.client) {
-        this.listClient = null;
-        void this.listTask.run([null]);
-      }
-      void this.branchesTask.run([null, ""]);
-      this.invalidateOperations();
-    }
-    if (identityChanged) {
-      this.records = [];
-      this.error = null;
-    }
-    if (snapshot.phase === "connected" && snapshot.client) {
-      void this.load();
-    }
-  }
-
   private invalidateOperations() {
-    this.operationEpoch += 1;
     this.busyId = null;
     this.creating = false;
     this.gcLoading = false;
-  }
-
-  private captureOperationScope(): WorktreeOperationScope | null {
-    const gateway = this.gatewaySource;
-    const client = this.client;
-    if (
-      !gateway ||
-      !client ||
-      !this.gatewayConnected ||
-      !this.isConnected ||
-      this.context.gateway !== gateway
-    ) {
-      return null;
-    }
-    return { gateway, client, epoch: this.operationEpoch };
-  }
-
-  private isOperationScopeCurrent(scope: WorktreeOperationScope): boolean {
-    return (
-      this.isConnected &&
-      this.gatewayConnected &&
-      this.gatewaySource === scope.gateway &&
-      this.context.gateway === scope.gateway &&
-      this.client === scope.client &&
-      this.operationEpoch === scope.epoch
-    );
   }
 
   private get operationPending(): boolean {
@@ -192,10 +128,10 @@ class WorktreesPage extends OpenClawLightDomElement {
   }
 
   private async load(options: { preserveError?: boolean } = {}) {
-    const client = this.client;
+    const client = this.gateway.client;
     if (
       !client ||
-      !this.gatewayConnected ||
+      !this.gateway.connected ||
       this.busyId !== null ||
       this.creating ||
       this.gcLoading ||
@@ -211,11 +147,18 @@ class WorktreesPage extends OpenClawLightDomElement {
   }
 
   private async removeWorktree(record: WorktreeRecord) {
-    const scope = this.captureOperationScope();
+    const scope = this.gateway.capture();
+    if (!scope || this.operationPending) {
+      return;
+    }
     if (
-      !scope ||
-      this.operationPending ||
-      !window.confirm(t("worktrees.confirmDelete", { name: record.name }))
+      !(await showConfirmDialog({
+        message: t("worktrees.confirmDelete", { name: record.name }),
+        confirmLabel: t("common.delete"),
+        danger: true,
+      })) ||
+      !this.gateway.isCurrent(scope) ||
+      this.operationPending
     ) {
       return;
     }
@@ -227,31 +170,41 @@ class WorktreesPage extends OpenClawLightDomElement {
       const result = await scope.client.request<WorktreesRemoveResult>("worktrees.remove", {
         id: record.id,
       });
-      if (!this.isOperationScopeCurrent(scope) || result.removed) {
+      if (!this.gateway.isCurrent(scope) || result.removed) {
         return;
       }
       const reason = result.snapshotError ?? "";
-      const force = window.confirm(t("worktrees.confirmForceDelete", { error: reason }));
+      const force = await showConfirmDialog({
+        message: t("worktrees.confirmForceDelete", { error: reason }),
+        confirmLabel: t("common.delete"),
+        danger: true,
+      });
+      if (!this.gateway.isCurrent(scope)) {
+        return;
+      }
       if (!force) {
         this.error = reason || null;
         return;
       }
-      if (!this.isOperationScopeCurrent(scope)) {
-        return;
-      }
       try {
-        await scope.client.request("worktrees.remove", { id: record.id, force: true });
+        const forced = await scope.client.request<WorktreesRemoveResult>("worktrees.remove", {
+          id: record.id,
+          force: true,
+        });
+        if (this.gateway.isCurrent(scope)) {
+          this.error = forced.snapshotError ?? null;
+        }
       } catch (forceError) {
-        if (this.isOperationScopeCurrent(scope)) {
-          this.error = String(forceError);
+        if (this.gateway.isCurrent(scope)) {
+          this.error = formatUiError(forceError);
         }
       }
     } catch (error) {
-      if (this.isOperationScopeCurrent(scope)) {
-        this.error = String(error);
+      if (this.gateway.isCurrent(scope)) {
+        this.error = formatUiError(error);
       }
     } finally {
-      if (this.isOperationScopeCurrent(scope)) {
+      if (this.gateway.isCurrent(scope)) {
         this.busyId = null;
         await this.load({ preserveError: true });
       }
@@ -259,7 +212,7 @@ class WorktreesPage extends OpenClawLightDomElement {
   }
 
   private async restore(record: WorktreeRecord) {
-    const scope = this.captureOperationScope();
+    const scope = this.gateway.capture();
     if (!scope || this.operationPending) {
       return;
     }
@@ -268,11 +221,11 @@ class WorktreesPage extends OpenClawLightDomElement {
     try {
       await scope.client.request("worktrees.restore", { id: record.id });
     } catch (error) {
-      if (this.isOperationScopeCurrent(scope)) {
-        this.error = String(error);
+      if (this.gateway.isCurrent(scope)) {
+        this.error = formatUiError(error);
       }
     } finally {
-      if (this.isOperationScopeCurrent(scope)) {
+      if (this.gateway.isCurrent(scope)) {
         this.busyId = null;
         await this.load({ preserveError: true });
       }
@@ -280,7 +233,7 @@ class WorktreesPage extends OpenClawLightDomElement {
   }
 
   private async gc() {
-    const scope = this.captureOperationScope();
+    const scope = this.gateway.capture();
     if (!scope || this.operationPending) {
       return;
     }
@@ -289,11 +242,11 @@ class WorktreesPage extends OpenClawLightDomElement {
     try {
       await scope.client.request("worktrees.gc", {});
     } catch (error) {
-      if (this.isOperationScopeCurrent(scope)) {
-        this.error = String(error);
+      if (this.gateway.isCurrent(scope)) {
+        this.error = formatUiError(error);
       }
     } finally {
-      if (this.isOperationScopeCurrent(scope)) {
+      if (this.gateway.isCurrent(scope)) {
         this.gcLoading = false;
         await this.load({ preserveError: true });
       }
@@ -314,7 +267,7 @@ class WorktreesPage extends OpenClawLightDomElement {
   }
 
   private loadCreateBranches() {
-    const client = this.gatewayConnected ? this.client : null;
+    const client = this.gateway.connected ? this.gateway.client : null;
     const repoRoot = this.createRepoRoot.trim();
     if (!client || !repoRoot) {
       this.createBranches = [];
@@ -325,7 +278,7 @@ class WorktreesPage extends OpenClawLightDomElement {
   }
 
   private async createWorktree() {
-    const scope = this.captureOperationScope();
+    const scope = this.gateway.capture();
     const repoRoot = this.createRepoRoot.trim();
     if (!scope || !repoRoot || this.operationPending) {
       return;
@@ -333,21 +286,21 @@ class WorktreesPage extends OpenClawLightDomElement {
     this.creating = true;
     this.error = null;
     try {
-      await scope.client.request("worktrees.create", {
+      await createManagedWorktree(scope.client, {
         repoRoot,
-        ...(this.createName.trim() ? { name: this.createName.trim() } : {}),
-        ...(this.createBaseRef.trim() ? { baseRef: this.createBaseRef.trim() } : {}),
+        name: this.createName,
+        baseRef: this.createBaseRef,
       });
-      if (this.isOperationScopeCurrent(scope)) {
+      if (this.gateway.isCurrent(scope)) {
         this.createOpen = false;
         this.createName = "";
       }
     } catch (error) {
-      if (this.isOperationScopeCurrent(scope)) {
-        this.error = String(error);
+      if (this.gateway.isCurrent(scope)) {
+        this.error = formatUiError(error);
       }
     } finally {
-      if (this.isOperationScopeCurrent(scope)) {
+      if (this.gateway.isCurrent(scope)) {
         this.creating = false;
         await this.load({ preserveError: true });
       }

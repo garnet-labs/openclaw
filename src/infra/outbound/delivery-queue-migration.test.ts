@@ -4,10 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createMessageReceiptFromOutboundResults } from "../../channels/message/receipt.js";
 import type { ChannelOutboundAdapter } from "../../channels/plugins/types.public.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry.js";
-import {
-  releasePinnedPluginChannelRegistry,
-  setActivePluginRegistry,
-} from "../../plugins/runtime.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { createOutboundTestPlugin, createTestRegistry } from "../../test-utils/channel-plugins.js";
 import {
@@ -23,6 +20,7 @@ import {
   OUTBOUND_LEGACY_PREPARATION_QUEUE_NAME,
 } from "./delivery-queue-media-staging.js";
 import { migrateLegacyPendingOutboundDeliveries } from "./delivery-queue-migration.js";
+import { recoverPendingDeliveries } from "./delivery-queue-recovery.js";
 import {
   enqueueDelivery,
   markDeliveryPlatformOutcomeUnknown,
@@ -31,7 +29,6 @@ import {
   type LegacyQueuedDeliveryPreparation,
   type QueuedDelivery,
 } from "./delivery-queue-storage.js";
-import { recoverPendingDeliveries } from "./delivery-queue.js";
 import {
   createRecoveryLog,
   installDeliveryQueueTmpDirHooks,
@@ -249,6 +246,7 @@ describe("outbound prepared queue migration", () => {
       loadDeliveryQueueEntry(OUTBOUND_LEGACY_PREPARATION_QUEUE_NAME, id, tmpDir()),
     ).toMatchObject({
       legacyPreparationState: "modifiers_started",
+      retainOnFailure: true,
       payloads: [{ text: "first" }],
     });
     releaseHook?.({ content: "first-prepared" });
@@ -309,6 +307,7 @@ describe("outbound prepared queue migration", () => {
     const interrupted = {
       ...legacyEntry(id, "must not be reconsidered"),
       legacyPreparationState: "modifiers_started",
+      retainOnFailure: true,
       deliveryCompletion: {
         kind: "conversation",
         agentId: "main",
@@ -332,6 +331,7 @@ describe("outbound prepared queue migration", () => {
     expect(hookMocks.runMessageSending).not.toHaveBeenCalled();
     expect(completionMocks.failDurableDelivery).toHaveBeenCalledWith(
       interrupted.deliveryCompletion,
+      tmpDir(),
     );
     expect(getDeliveryQueueEntryStatus(OUTBOUND_LEGACY_PREPARATION_QUEUE_NAME, id, tmpDir())).toBe(
       "failed",
@@ -339,14 +339,15 @@ describe("outbound prepared queue migration", () => {
     const failedFence = readQueueEntryJson(OUTBOUND_LEGACY_PREPARATION_QUEUE_NAME, id, tmpDir());
     expect(failedFence).toBeDefined();
     expect(failedFence).not.toContain("must not be reconsidered");
-    expect(JSON.parse(failedFence ?? "{}")).toMatchObject({
+    const failedEntry = JSON.parse(failedFence ?? "{}") as Record<string, unknown>;
+    expect(failedEntry).toMatchObject({
       id,
-      enqueuedAt: 100,
+      enqueuedAt: expect.any(Number),
       retryCount: 0,
-      attemptCount: 0,
     });
-    expect(JSON.parse(failedFence ?? "{}")).not.toHaveProperty("payloads");
-    expect(JSON.parse(failedFence ?? "{}")).not.toHaveProperty("deliveryCompletion");
+    expect(failedEntry.enqueuedAt).toBe(failedEntry.failedAt);
+    expect(failedEntry).not.toHaveProperty("payloads");
+    expect(failedEntry).not.toHaveProperty("deliveryCompletion");
     expect(loadDeliveryQueueEntry(OUTBOUND_DELIVERY_QUEUE_NAME, id, tmpDir())).toBeNull();
   });
 
@@ -355,6 +356,7 @@ describe("outbound prepared queue migration", () => {
     const active = {
       ...legacyEntry(id, "active raw input"),
       legacyPreparationState: "modifiers_started",
+      retainOnFailure: true,
       legacyPreparationOwnerId: "other-process",
       legacyPreparationLeaseExpiresAt: Date.now() + 60_000,
       deliveryCompletion: {
@@ -408,7 +410,7 @@ describe("outbound prepared queue migration", () => {
     expect(hookMocks.runMessageSending).not.toHaveBeenCalled();
     expect(
       loadDeliveryQueueEntry(OUTBOUND_LEGACY_PREPARATION_QUEUE_NAME, id, tmpDir()),
-    ).toMatchObject({ legacyPreparationState: "claimed" });
+    ).toMatchObject({ legacyPreparationState: "claimed", retainOnFailure: true });
 
     hookMocks.hasHooks.mockImplementation(
       (name?: string) => name === "message_sending" || name === "message_sent",
@@ -868,7 +870,7 @@ describe("outbound prepared queue migration", () => {
   });
 
   afterEach(() => {
-    releasePinnedPluginChannelRegistry();
+    resetPluginRuntimeStateForTest();
     setActivePluginRegistry(createEmptyPluginRegistry());
   });
 });

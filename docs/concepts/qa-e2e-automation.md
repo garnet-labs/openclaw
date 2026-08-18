@@ -609,11 +609,21 @@ Discord YAML module scenarios (`qa/scenarios/channels/discord-*.yaml`):
 - `discord-canary`
 - `discord-mention-gating`
 - `discord-native-help-command-registration`
+- `discord-progress-draft-lifecycle` - runs a deterministic tool turn, verifies
+  the final answer has no synthesized activity receipt, confirms the working
+  draft is deleted after a successful final, and confirms an error final keeps
+  its draft visible as diagnostic context.
 - `discord-voice-autojoin` - opt-in voice scenario. Runs by itself, enables
   `channels.discord.voice.autoJoin`, and verifies the SUT bot's current
   Discord voice state is the target voice/stage channel. Convex Discord
   credentials may include optional `voiceChannelId`; otherwise the runner
   adapter discovers the first visible voice/stage channel in the guild.
+- `discord-transcripts-voice-authorization` - opt-in live-model scenario. A
+  real driver-bot message first proves a sender excluded from the target voice
+  channel receives a visible transcript-tool denial without a join. The same
+  sender is then allowlisted and must start, stop, and leave live capture. The
+  scenario writes redacted JSON evidence and deletes its known Discord
+  messages during cleanup.
 - `discord-status-reactions-tool-only` - opt-in Mantis scenario. Runs by
   itself because it switches the SUT to always-on, tool-only guild replies
   with `messages.statusReactions.enabled=true`, then captures a REST
@@ -629,6 +639,16 @@ Run the Discord voice auto-join scenario explicitly:
 pnpm openclaw qa discord \
   --scenario discord-voice-autojoin \
   --provider-mode mock-openai
+```
+
+Run the transcript authorization scenario with a Convex lease:
+
+```bash
+pnpm openclaw qa discord \
+  --scenario discord-transcripts-voice-authorization \
+  --provider-mode live-frontier \
+  --credential-source convex \
+  --credential-role maintainer
 ```
 
 Run the Mantis status-reaction scenario explicitly:
@@ -685,8 +705,9 @@ Slack YAML module scenarios (`qa/scenarios/channels/slack-*.yaml`):
 
 - `slack-canary`
 - `slack-mention-gating`
-- `slack-mpim-app-mention-dedupe` - opens a real C-prefixed group DM, sends one
-  mention, verifies exactly one SUT reply in that MPIM, then closes it.
+- `slack-mpim-app-mention-dedupe` - opens a real C-prefixed group DM, verifies
+  exactly one SUT reply after message/app-mention twin delivery, confirms a
+  native threaded follow-up can recall that bot reply, then closes the MPIM.
 - `slack-allowlist-block`
 - `slack-channel-disabled-warning` - opt-in real-Slack probe that confirms a
   configured disabled channel emits a structured warning without replying.
@@ -723,7 +744,7 @@ Slack YAML module scenarios (`qa/scenarios/channels/slack-*.yaml`):
   scenario. Enables the Codex plugin in Guardian mode, routes a
   Slack-originated Gateway agent turn through the Codex app-server harness,
   waits for the native Slack plugin approval prompt for
-  `openclaw-codex-app-server`, resolves it, and verifies the Codex turn
+  `codex`, resolves it, and verifies the Codex turn
   finishes with the expected command-output and assistant markers.
 - `slack-codex-approval-plugin-native` - opt-in Codex Guardian file approval
   scenario. Uses an outside-workspace `apply_patch` instruction so Codex emits
@@ -1076,7 +1097,8 @@ sutAuthTag?: string }` - `relayUrl` must use `wss://`, with `ws://` allowed only
   for loopback relays; `roomId` must be a channel UUID, and the identities must
   be distinct.
 - Discord (`kind: "discord"`): `{ guildId: string, channelId: string,
-driverBotToken: string, sutBotToken: string, sutApplicationId: string }`.
+driverBotToken: string, sutBotToken: string, sutApplicationId: string,
+voiceChannelId?: string }`.
 - Telegram (`kind: "telegram"`): `{ groupId: string, driverToken: string,
 sutToken: string }` - `groupId` must be a numeric chat-id string.
 - Telegram real user (`kind: "telegram-user"`): `{ groupId: string, sutToken:
@@ -1119,6 +1141,13 @@ Seed assets live in `qa/`:
 
 - `qa/scenarios/index.yaml`
 - `qa/scenarios/<theme>/*.yaml`
+
+Identity-sensitive channel changes use the isolated
+`channel-participant-identity-inspection` QA Channel flow. It drives a real
+ephemeral Gateway and mock provider, then inspects admitted runs with the same
+`openclaw audit --run ... --explain` JSON and human surfaces operators use.
+The flow includes lifecycle-owned restart and a row-count check for rejected
+pre-run ingress.
 
 These are intentionally in git so the QA plan is visible to both humans and
 the agent.
@@ -1229,12 +1258,16 @@ The minimum adoption bar for a new channel:
 4. Mount the runner as `openclaw qa <runner>` instead of registering a
    competing root command. Runner plugins should declare `qaRunners` in
    `openclaw.plugin.json` and export a matching `qaRunnerCliRegistrations`
-   array from `runtime-api.ts`. Keep `runtime-api.ts` light; lazy CLI and
-   runner execution should stay behind separate entrypoints. An optional
-   `adapterFactory` exposes the transport to shared scenarios without changing
-   the command's existing scenario catalog. Same-channel partitions are serial
-   unless the factory declares that every instance owns isolated credentials or
-   disposable servers, Gateway state, and artifact paths.
+   array from a lightweight `qa-runner-api.ts` surface. Installed plugins using
+   the shipped `runtime-api.ts` contract remain supported through 2026-10-01
+   while authors migrate. Keep runner execution behind lazy entrypoints. An
+   optional `adapterFactory` exposes the transport to shared scenarios without
+   changing the command's existing scenario catalog. Same-channel partitions
+   are serial unless the factory declares that every instance owns isolated
+   credentials or disposable servers, Gateway state, and artifact paths.
+   Module-backed flow scenarios additionally require
+   `adapterFactory.supportsModuleFlows: true`; those factories must return
+   adapters that implement `prepareFlow`.
 5. Author or adapt YAML scenarios under the themed `qa/scenarios/`
    directories.
 6. Use the generic scenario helpers for new scenarios.
@@ -1259,8 +1292,7 @@ Preferred generic helpers for new scenarios:
 - `waitForChannelReady`
 - `injectInboundMessage`
 - `injectOutboundMessage`
-- `waitForTransportOutboundMessage`
-- `waitForChannelOutboundMessage`
+- `waitForOutboundMessage`
 - `waitForNoTransportOutbound`
 - `getTransportSnapshot`
 - `readTransportMessage`
@@ -1269,10 +1301,10 @@ Preferred generic helpers for new scenarios:
 - `resetTransport`
 
 Compatibility aliases remain available for existing scenarios -
-`waitForQaChannelReady`, `waitForOutboundMessage`, `waitForNoOutbound`,
-`formatConversationTranscript`, `resetBus` - but new scenario authoring
-should use the generic names. The aliases exist to avoid a flag-day
-migration, not as the model going forward.
+`waitForQaChannelReady`, `waitForNoOutbound`, `formatConversationTranscript`,
+and `resetBus` - but new scenario authoring should use the generic names.
+Use the canonical `waitForOutboundMessage` for outbound checks instead of
+adding transport- or channel-specific outbound wait aliases.
 
 ## Reporting
 
@@ -1342,11 +1374,11 @@ candidate refs are replaced with neutral labels such as `candidate-01`; the
 report maps rankings back to real refs after parsing.
 
 Candidate runs default to `high` thinking, with `medium` for GPT-5.6 Luna and
-`xhigh` for older OpenAI eval refs that support it. Override a specific
-candidate inline with `--model provider/model,thinking=<level>`; inline
-options also support `fast`, `no-fast`, and `fast=<bool>`. `--thinking
-<level>` still sets a global fallback, and the older `--model-thinking
-<provider/model=level>` form is kept for compatibility. OpenAI candidate
+`xhigh` for older OpenAI eval refs that support it. Override a specific candidate
+inline with `--model provider/model,thinking=<level>`; inline options also support
+`fast`, `no-fast`, and `fast=<bool>`. `--thinking <level>` still sets a global
+fallback, and the older `--model-thinking <provider/model=level>` form is kept for
+compatibility. OpenAI candidate
 refs default to fast mode so priority processing is used where the provider
 supports it. Pass `--fast` only when you want to force fast mode on for
 every candidate model. Candidate and judge durations are recorded in the

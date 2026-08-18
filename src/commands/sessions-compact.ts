@@ -7,7 +7,7 @@
  * (transport error or an `ok:false` payload) so automation never mistakes a
  * silent no-op for success.
  */
-import { callGatewayCli, type GatewayRpcOpts } from "../cli/gateway-cli/call.js";
+import { callGatewayFromCliWithTransport } from "../cli/gateway-rpc.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
 
@@ -28,7 +28,6 @@ type SessionsCompactResult = {
   compacted?: boolean;
   reason?: string;
   kept?: number;
-  archived?: string;
   result?: {
     tokensBefore?: number;
     tokensAfter?: number;
@@ -44,6 +43,8 @@ type SessionsCompactResult = {
     };
   };
 };
+
+type SessionsCompactRpcOpts = Parameters<typeof callGatewayFromCliWithTransport>[1];
 
 function describeCompaction(result: SessionsCompactResult, fallbackKey: string): string {
   const sessionKey = result.key ?? fallbackKey;
@@ -71,7 +72,7 @@ export async function sessionsCompactCommand(
   opts: SessionsCompactCliOptions,
   runtime: RuntimeEnv,
 ): Promise<void> {
-  const rpcOpts: GatewayRpcOpts = {
+  const rpcOpts: SessionsCompactRpcOpts = {
     url: opts.url,
     token: opts.token,
     password: opts.password,
@@ -88,7 +89,9 @@ export async function sessionsCompactCommand(
 
   let result: SessionsCompactResult;
   try {
-    result = (await callGatewayCli("sessions.compact", rpcOpts, params)) as SessionsCompactResult;
+    result = (await callGatewayFromCliWithTransport("sessions.compact", rpcOpts, params, {
+      defaultTimeoutMs: 10_000,
+    })) as SessionsCompactResult;
   } catch (err) {
     const message = formatErrorMessage(err);
     if (opts.json) {
@@ -121,7 +124,4 @@ export async function sessionsCompactCommand(
   }
 
   runtime.log(describeCompaction(result ?? {}, opts.key));
-  if (result?.archived) {
-    runtime.log(`Archived transcript: ${result.archived}`);
-  }
 }

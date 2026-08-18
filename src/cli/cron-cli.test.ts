@@ -157,6 +157,30 @@ function buildProgram() {
   return program;
 }
 
+const CRON_GATEWAY_COMMANDS = [
+  { name: "status", args: [] },
+  { name: "list", args: [] },
+  { name: "add", args: [] },
+  { name: "rm", args: ["job-1"] },
+  { name: "enable", args: ["job-1"] },
+  { name: "disable", args: ["job-1"] },
+  { name: "get", args: ["job-1"] },
+  { name: "show", args: ["job-1"] },
+  { name: "runs", args: ["--id", "job-1"] },
+  { name: "run", args: ["job-1"] },
+  { name: "scratch", args: ["job-1"] },
+  { name: "edit", args: ["job-1"] },
+] as const;
+
+function findCronCommand(program: Command, name: string): Command {
+  const cron = program.commands.find((command) => command.name() === "cron");
+  const command = cron?.commands.find((candidate) => candidate.name() === name);
+  if (!command) {
+    throw new Error(`missing cron command: ${name}`);
+  }
+  return command;
+}
+
 function createCronJob(id: string, name: string): CronJob {
   const now = Date.now();
   return {
@@ -338,6 +362,65 @@ async function runCronRunAndCaptureExit(params: {
 }
 
 describe("cron cli", () => {
+  it.each(CRON_GATEWAY_COMMANDS)(
+    "inherits parent Gateway options for cron $name",
+    async ({ name, args }) => {
+      const program = buildProgram();
+      const command = findCronCommand(program, name);
+      command.action(() => {});
+
+      await program.parseAsync(
+        ["automations", "--port", "65267", "--token", "parent-token", name, ...args],
+        { from: "user" },
+      );
+
+      expect(command.opts()).toMatchObject({ port: "65267", token: "parent-token" });
+    },
+  );
+
+  it.each(CRON_GATEWAY_COMMANDS)(
+    "accepts leaf Gateway options for cron $name",
+    async ({ name, args }) => {
+      const program = buildProgram();
+      const command = findCronCommand(program, name);
+      command.action(() => {});
+
+      await program.parseAsync(
+        ["automations", name, ...args, "--port", "65268", "--token", "leaf-token"],
+        { from: "user" },
+      );
+
+      expect(command.opts()).toMatchObject({
+        port: "65268",
+        token: "leaf-token",
+      });
+    },
+  );
+
+  it("prefers explicit leaf Gateway options over cron parent options", async () => {
+    const program = buildProgram();
+    const command = findCronCommand(program, "add");
+    command.action(() => {});
+
+    await program.parseAsync(
+      [
+        "cron",
+        "--port",
+        "65267",
+        "--token",
+        "parent-token",
+        "add",
+        "--port",
+        "65268",
+        "--token",
+        "leaf-token",
+      ],
+      { from: "user" },
+    );
+
+    expect(command.opts()).toMatchObject({ port: "65268", token: "leaf-token" });
+  });
+
   it("documents the gateway-host timezone default for cron --tz help", () => {
     const program = buildProgram();
     const cronCommand = program.commands.find((command) => command.name() === "cron");
@@ -395,6 +478,59 @@ describe("cron cli", () => {
       expect(stdoutText()).toContain(`"status": "${status}"`);
     },
   );
+
+  it.each([
+    { name: "rm", args: ["cron", "rm", "missing"], method: "cron.remove" },
+    { name: "enable", args: ["cron", "enable", "missing"], method: "cron.update" },
+    { name: "disable", args: ["cron", "disable", "missing"], method: "cron.update" },
+    { name: "run", args: ["cron", "run", "missing"], method: "cron.run" },
+    { name: "scratch", args: ["cron", "scratch", "missing"], method: "cron.scratch.get" },
+    { name: "runs", args: ["cron", "runs", "--id", "missing"], method: "cron.runs" },
+  ])("keeps the canonical lookup miss for cron $name", async ({ args, method }) => {
+    resetGatewayMock();
+    callGatewayFromCli.mockImplementation(
+      async (calledMethod: string, opts: unknown, params?: unknown, timeoutMs?: number) => {
+        if (calledMethod === method) {
+          throw Object.assign(new Error("gateway cron lookup failed"), {
+            details: { code: "CRON_JOB_NOT_FOUND", jobId: "missing" },
+          });
+        }
+        return await defaultGatewayMock(calledMethod, opts, params, timeoutMs);
+      },
+    );
+
+    const program = buildProgram();
+    await expect(program.parseAsync(args, { from: "user" })).rejects.toThrow("__exit__:1");
+
+    expectRuntimeErrorContaining(
+      "Automation not found: missing. Run `openclaw cron list` to see recent automation ids.",
+    );
+  });
+
+  it("keeps real empty cron history as an exact stdout success payload", async () => {
+    const emptyPage = {
+      entries: [],
+      total: 0,
+      offset: 0,
+      limit: 50,
+      hasMore: false,
+      nextOffset: null,
+    };
+    resetGatewayMock();
+    callGatewayFromCli.mockImplementation(
+      async (method: string, opts: unknown, params?: unknown, timeoutMs?: number) =>
+        method === "cron.runs"
+          ? emptyPage
+          : await defaultGatewayMock(method, opts, params, timeoutMs),
+    );
+
+    const program = buildProgram();
+    await program.parseAsync(["cron", "runs", "--id", "empty-cron"], { from: "user" });
+
+    expect(stdoutText()).toBe(JSON.stringify(emptyPage, null, 2));
+    expect(defaultRuntime.error).not.toHaveBeenCalled();
+    expect(defaultRuntime.exit).not.toHaveBeenCalled();
+  });
 
   it.each([
     {
@@ -989,6 +1125,13 @@ describe("cron cli", () => {
     });
   });
 
+  it.each(["", "   "])("rejects a blank cron list agent filter %j", async (agent) => {
+    await expectCronCommandExit(["cron", "list", "--agent", agent]);
+
+    expectRuntimeErrorContaining("--agent must not be blank");
+    expect(callGatewayFromCli.mock.calls.some(([method]) => method === "cron.list")).toBe(false);
+  });
+
   it("routes cron get to cron.get with the provided id", async () => {
     await runCronCommand(["cron", "get", "job-1"]);
 
@@ -996,6 +1139,33 @@ describe("cron cli", () => {
     expect(getCall?.[2]).toEqual({ id: "job-1" });
     expect(stdoutText()).toContain('"id": "job-1"');
   });
+
+  it.each([
+    {
+      name: "get",
+      args: ["cron", "get", "job-1", "--json"],
+      method: "cron.get",
+      params: { id: "job-1" },
+    },
+    {
+      name: "runs",
+      args: ["cron", "runs", "--id", "job-1", "--json"],
+      method: "cron.runs",
+      params: { id: "job-1", limit: 50 },
+    },
+  ])(
+    "accepts --json for cron $name and prints one JSON object",
+    async ({ args, method, params }) => {
+      await runCronCommand(args);
+
+      const gatewayCall = callGatewayFromCli.mock.calls.find(
+        ([calledMethod]) => calledMethod === method,
+      );
+      expect(gatewayCall?.[2]).toEqual(params);
+      expect(defaultRuntime.writeJson).toHaveBeenCalledOnce();
+      expect(() => JSON.parse(stdoutText())).not.toThrow();
+    },
+  );
 
   it("rejects partial cron runs limit", async () => {
     await expectCronCommandExit(["cron", "runs", "--id", "job-1", "--limit", "10x"]);
@@ -1005,6 +1175,13 @@ describe("cron cli", () => {
       expect.anything(),
       expect.anything(),
     );
+  });
+
+  it.each(["", "   "])("rejects a blank cron run history filter %j", async (runId) => {
+    await expectCronCommandExit(["cron", "runs", "--id", "job-1", "--run-id", runId]);
+
+    expectRuntimeErrorContaining("--run-id must not be blank");
+    expect(callGatewayFromCli.mock.calls.some(([method]) => method === "cron.runs")).toBe(false);
   });
 
   it("paginates cron show lookups", async () => {
@@ -1649,6 +1826,63 @@ describe("cron cli", () => {
     expect(params.schedule.at).toBe("2026-03-23T22:00:00.000Z");
   });
 
+  it.each([
+    ["2027-02-28T24:00:00", "UTC", "2027-03-01T00:00:00.000Z"],
+    ["2027-02-28t24:00", "UTC", "2027-03-01T00:00:00.000Z"],
+    ["2027-02-28t24:00:00.000", "Europe/Oslo", "2027-02-28T23:00:00.000Z"],
+    ["2027-02-28T24:00:00", "America/New_York", "2027-03-01T05:00:00.000Z"],
+    ["2027-02-28T24:00:00", "Europe/Oslo", "2027-02-28T23:00:00.000Z"],
+    ["2027-03-13T24:00:00", "America/New_York", "2027-03-14T05:00:00.000Z"],
+    ["2027-03-14T24:00:00", "America/New_York", "2027-03-15T04:00:00.000Z"],
+    ["2027-03-14t24:00", "America/New_York", "2027-03-15T04:00:00.000Z"],
+    ["2027-03-27T24:00:00", "Europe/Oslo", "2027-03-27T23:00:00.000Z"],
+    ["2027-03-28T24:00:00", "Europe/Oslo", "2027-03-28T22:00:00.000Z"],
+  ])(
+    "rolls local end-of-day --at %s into the next day in %s on cron add",
+    async (at, tz, expected) => {
+      const params = await runCronAddAndGetParams([
+        "--name",
+        "tz-at-end-of-day",
+        "--at",
+        at,
+        "--tz",
+        tz,
+        "--session",
+        "isolated",
+        "--message",
+        "test",
+      ]);
+
+      expect(params.schedule).toEqual({ kind: "at", at: expected });
+    },
+  );
+
+  it.each([
+    ["2027-02-28T24:01:00", "UTC"],
+    ["2027-02-28t24:01", "UTC"],
+    ["2027-02-28T24:00:00.001", "America/New_York"],
+    ["2027-02-28t24:00:00.001", "America/New_York"],
+    ["2027-09-04T24:00:00", "America/Santiago"],
+  ])(
+    "rejects invalid or nonexistent local end-of-day --at %s in %s on cron add",
+    async (at, tz) => {
+      await expectCronCommandExit([
+        "cron",
+        "add",
+        "--name",
+        "invalid-tz-at-end-of-day",
+        "--at",
+        at,
+        "--tz",
+        tz,
+        "--session",
+        "isolated",
+        "--message",
+        "test",
+      ]);
+    },
+  );
+
   it("does not apply --tz when --at already has an offset", async () => {
     await runCronCommand([
       "cron",
@@ -1790,6 +2024,39 @@ describe("cron cli", () => {
     });
     expect(patch?.patch).not.toHaveProperty("deleteAfterRun");
   });
+
+  it.each([
+    ["2027-02-28T24:00:00", "UTC", "2027-03-01T00:00:00.000Z"],
+    ["2027-02-28t24:00", "UTC", "2027-03-01T00:00:00.000Z"],
+    ["2027-02-28t24:00:00.000", "Europe/Oslo", "2027-02-28T23:00:00.000Z"],
+    ["2027-02-28T24:00:00", "America/New_York", "2027-03-01T05:00:00.000Z"],
+    ["2027-02-28T24:00:00", "Europe/Oslo", "2027-02-28T23:00:00.000Z"],
+    ["2027-03-13T24:00:00", "America/New_York", "2027-03-14T05:00:00.000Z"],
+    ["2027-03-14T24:00:00", "America/New_York", "2027-03-15T04:00:00.000Z"],
+    ["2027-03-14t24:00", "America/New_York", "2027-03-15T04:00:00.000Z"],
+    ["2027-03-27T24:00:00", "Europe/Oslo", "2027-03-27T23:00:00.000Z"],
+    ["2027-03-28T24:00:00", "Europe/Oslo", "2027-03-28T22:00:00.000Z"],
+  ])(
+    "rolls local end-of-day --at %s into the next day in %s on cron edit",
+    async (at, tz, expected) => {
+      const patch = await runCronEditAndGetPatch(["--at", at, "--tz", tz]);
+
+      expect(patch.patch?.schedule).toEqual({ kind: "at", at: expected });
+    },
+  );
+
+  it.each([
+    ["2027-02-28T24:01:00", "UTC"],
+    ["2027-02-28t24:01", "UTC"],
+    ["2027-02-28T24:00:00.001", "America/New_York"],
+    ["2027-02-28t24:00:00.001", "America/New_York"],
+    ["2027-09-04T24:00:00", "America/Santiago"],
+  ])(
+    "rejects invalid or nonexistent local end-of-day --at %s in %s on cron edit",
+    async (at, tz) => {
+      await expectCronCommandExit(["cron", "edit", "job-1", "--at", at, "--tz", tz]);
+    },
+  );
 
   it("preserves an explicit keep policy when converting to --at", async () => {
     const patch = await runCronEditAndGetPatch([
