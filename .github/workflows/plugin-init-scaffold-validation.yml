@@ -42,6 +42,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN_DEV }}
+          api_url: https://dev-api.garnet.ai
+
       - name: Setup Node environment
         uses: ./.github/actions/setup-node-env
         with:
