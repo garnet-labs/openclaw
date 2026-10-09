@@ -210,6 +210,37 @@ const exists = (root, dir, file) => readSource(root, joined(dir, file), true) !=
 const nearest = (root, dir, file) => ancestors(dir).find(d => exists(root, d, file));
 const packageData = (root, dir) => JSON.parse(readSource(root, joined(dir, 'package.json')));
 const fixturePath = dir => dir.split('/').some(p => /^(?:\.?fixtures|__fixtures__)$/.test(p));
+const NPM_DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+const localEntryExists = (root, relative) => {
+  let cursor = root;
+  for (const component of relative === '.' ? [] : relative.split('/')) {
+    cursor = path.join(cursor, component);
+    try { if (fs.lstatSync(cursor).isSymbolicLink()) return false; }
+    catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false; throw error; }
+  }
+  return true;
+};
+// npm cannot install link:/workspace:/portal: specifiers, and a file: target
+// that is a build output or lies outside the exact source never exists in the
+// isolated copy. Classify these before the sensor starts instead of recording
+// a guaranteed install failure.
+export function assertNpmLocalSpecifiers(root, dir, pkg) {
+  for (const field of NPM_DEPENDENCY_FIELDS) {
+    const deps = pkg[field];
+    if (deps === undefined) continue;
+    assert(deps && typeof deps === 'object' && !Array.isArray(deps), 'BLOCKED: npm_invalid_dependency_field');
+    for (const spec of Object.values(deps)) {
+      if (typeof spec !== 'string') continue;
+      assert(!/^(?:link|workspace|portal):/.test(spec),
+        'BLOCKED: npm_unsupported_local_protocol: npm cannot install link:, workspace: or portal: dependencies');
+      const file = /^file:(.*)$/.exec(spec)?.[1];
+      if (file === undefined) continue;
+      const target = path.posix.normalize(path.posix.join(dir, file));
+      assert(!file.startsWith('/') && target !== '..' && !target.startsWith('../') && localEntryExists(root, target),
+        'BLOCKED: npm_local_file_dependency_missing: file: dependency target is absent from the exact source');
+    }
+  }
+}
 
 function managerSpec(value) {
   if (value === undefined) return null;
@@ -386,6 +417,7 @@ export function planWorkloads(root, changed, context) {
           'corepack pnpm install --frozen-lockfile');
         note = spec ? 'packageManager respected' : 'pnpm fallback version selected from lockfile version';
       } else {
+        assertNpmLocalSpecifiers(root, dir, pkg);
         const hasLock = exists(root, dir, 'package-lock.json') || exists(root, dir, 'npm-shrinkwrap.json');
         locked = hasLock;
         if (spec?.name === 'npm') {
