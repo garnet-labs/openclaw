@@ -948,6 +948,7 @@ jobs:
   security-fast:
     permissions:
       contents: read
+      pull-requests: write
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -1008,6 +1009,11 @@ jobs:
             fetch_checkout_ref "$CHECKOUT_FALLBACK_REF"
           fi
           git -C "$GITHUB_WORKSPACE" checkout --detach refs/remotes/origin/checkout
+
+      - name: Start Garnet runtime sensor
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
 
       - name: Resolve security diff base
         id: diff_base
@@ -1220,6 +1226,7 @@ jobs:
   build-artifacts:
     permissions:
       contents: read
+      pull-requests: write
     needs: [preflight]
     if: needs.preflight.outputs.run_build_artifacts == 'true'
     # 32 vCPU: the dist build sits on the light-run critical path alongside
@@ -1229,6 +1236,11 @@ jobs:
     timeout-minutes: ${{ (vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || (vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && github.run_attempt > 1) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 35 || 20 }}
     steps:
       - *linux_node_checkout_step
+      - name: Start Garnet runtime sensor
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
       - name: Ensure secrets base commit (PR fast path)
         if: github.event_name == 'pull_request'
         uses: ./.github/actions/ensure-base-commit
@@ -1823,6 +1835,11 @@ jobs:
       CHECKOUT_BASE_SHA: ${{ matrix.task == 'baseline-ratchets' && needs.preflight.outputs.diff_base_revision || '' }}
     steps:
       - *linux_node_checkout_step
+      - name: Start Garnet runtime sensor
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
       - name: Prepare release-gate ratchet merge tree
         if: matrix.task == 'baseline-ratchets' && github.event_name == 'workflow_dispatch' && inputs.release_gate
         env:
@@ -3118,12 +3135,18 @@ jobs:
   check-docs:
     permissions:
       contents: read
+      pull-requests: write
     needs: [preflight]
     if: needs.preflight.outputs.run_check_docs == 'true'
     runs-on: ${{ (vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid') && 'ubuntu-24.04' || github.event_name == 'workflow_dispatch' && 'ubuntu-24.04' || (github.repository == 'openclaw/openclaw' && (github.event_name != 'pull_request' || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association)) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04') }}
     timeout-minutes: 20
     steps:
       - *linux_node_checkout_step
+      - name: Start Garnet runtime sensor
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+
       - name: Setup Node environment
         uses: ./.github/actions/setup-node-env
         with:

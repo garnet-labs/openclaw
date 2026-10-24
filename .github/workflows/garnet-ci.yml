@@ -1,0 +1,14 @@
+name: Garnet Runtime Visibility — openclaw
+on:
+  workflow_dispatch:
+jobs:
+  dep-install:
+    name: Dependency Install
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v4
+      - name: Garnet Runtime Visibility
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
